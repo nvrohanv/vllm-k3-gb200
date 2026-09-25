@@ -53,6 +53,11 @@ def _enabled() -> bool:
 
 def _build_cells() -> dict:
     cells = {k: dict(v) for k, v in CELLS_DEFAULT.items()}
+    # K3GEMV_ONLY="3216x7168,2112x7168": restrict routing to these (N x K) weights.
+    only = os.environ.get("K3GEMV_ONLY", "")
+    if only:
+        keep = {tuple(int(v) for v in item.split("x")) for item in only.split(",") if item}
+        cells = {k: v for k, v in cells.items() if k in keep}
     if os.environ.get("K3GEMV_EARLY", "0") == "1":
         for k, v in CELLS_EARLY.items():
             cells.setdefault(k, {}).update(v)

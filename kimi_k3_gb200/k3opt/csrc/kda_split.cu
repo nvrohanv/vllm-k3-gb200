@@ -2,7 +2,10 @@
 // thread-block cluster.  Drop-in replacement for torch.ops.k3kda.fused_kda_decode
 // (gpu-opt/k3opt/csrc/kda_decode6.cu): same schema, same math, same in-place
 // state / conv_state updates, bit-identical results.  Registered as
-// torch.ops.k3kdas.fused_kda_decode (+ fused_kda_decode_split for tuning).
+// torch.ops.k3kdas.fused_kda_decode (+ fused_kda_decode_split for tuning), and
+// torch.ops.k3kdas.fused_kda_decode_fb: the same with the KDA gate up-projection
+// (f_b_proj, [768, 128] bf16 GEMV) folded in -- takes f_a + the f_b weight instead
+// of raw_g, bit-identical to f_b_proj (cuBLAS) + fused_kda_decode (see kFB below).
 //
 // Why the old kernel is slow: one 256-thread CTA per (token, head) walks all 128
 // value rows of the 64 KB fp32 state in 4 cp.async chunks, with two 5-level warp
@@ -88,6 +91,10 @@ struct KdaSplitParams {
   float lower_bound;
   float scale;
   float eps;
+  // fused_kda_decode_fb only: g = f_a @ W_fb^T computed in-kernel (g above unused)
+  const __nv_bfloat16* fa;      // [B, 128] bf16, row stride fa_row
+  const __nv_bfloat16* w_fb;    // [kDim, 128] bf16 row-major (f_b_proj.weight, TP-local)
+  int64_t fa_row;
   unsigned long long* ts;       // K3KDAS_TIMING builds only: [grid CTAs, 32] stamps
 };
 
@@ -97,20 +104,34 @@ __device__ __forceinline__ unsigned long long globaltimer() {
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
   return t;
 }
-// ts[cta][0..15] = %globaltimer, ts[cta][16..31] = clock64 at stamp k
-#define K3KDAS_TS(k)                                                                   \
+// ts[cta][0..31] = %globaltimer, ts[cta][32..63] = clock64 at stamp k; stamps 0..15 by
+// thread 0, 16..31 by the kFB gate warp's lane 0 (K3KDAS_TSG).
+#define K3KDAS_TS_BY(tid_, k)                                                          \
   do {                                                                                 \
-    if (threadIdx.x == 0 && p.ts != nullptr) {                                         \
+    if (threadIdx.x == (tid_) && p.ts != nullptr) {                                    \
       unsigned long long* t_ =                                                         \
-          p.ts + ((blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 32; \
+          p.ts + ((blockIdx.z * gridDim.y + blockIdx.y) * gridDim.x + blockIdx.x) * 64; \
       t_[(k)] = globaltimer();                                                         \
-      t_[16 + (k)] = static_cast<unsigned long long>(clock64());                       \
+      t_[32 + (k)] = static_cast<unsigned long long>(clock64());                       \
     }                                                                                  \
   } while (0)
+#define K3KDAS_TS(k) K3KDAS_TS_BY(0, k)
+#define K3KDAS_TSG(k) K3KDAS_TS_BY(kD, 16 + (k))
 #define K3KDAS_NS k3kdas_t
+#elif defined(K3KDAS_EXP)  // A/B experiment builds of this file
+#define K3KDAS_TS(k) \
+  do {               \
+  } while (0)
+#define K3KDAS_NS k3kdas_exp
+#define K3KDAS_TSG(k) \
+  do {                \
+  } while (0)
 #else
 #define K3KDAS_TS(k) \
   do {               \
+  } while (0)
+#define K3KDAS_TSG(k) \
+  do {                \
   } while (0)
 #define K3KDAS_NS k3kdas
 #endif
@@ -139,6 +160,22 @@ __device__ __forceinline__ float rcp_fast(float y) {
   return fmaf(r, -e, r);
 }
 
+// D += A(16x16, row) * B(16x8, col), bf16 in, fp32 accumulate.
+__device__ __forceinline__ void mma_bf16_16816(float (&d)[4], uint32_t a0, uint32_t a1,
+                                               uint32_t a2, uint32_t a3, uint32_t b0,
+                                               uint32_t b1) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, "
+      "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint2 ldg_nc_u2(const void* p) {
+  uint2 v;
+  asm volatile("ld.global.nc.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+  return v;
+}
+
 // ---- PDL / cluster / mbarrier primitives -------------------------------------
 __device__ __forceinline__ void pdl_wait() {
   asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -160,6 +197,11 @@ __device__ __forceinline__ uint32_t map_rank0(uint32_t a) {
   asm volatile("mapa.shared::cluster.u32 %0, %1, 0;" : "=r"(r) : "r"(a));
   return r;
 }
+__device__ __forceinline__ uint32_t map_rank(uint32_t a, uint32_t rank) {
+  uint32_t r;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(rank));
+  return r;
+}
 __device__ __forceinline__ void mbar_init_expect(uint32_t bar, uint32_t tx_bytes) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(bar) : "memory");
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar),
@@ -176,6 +218,18 @@ __device__ __forceinline__ void st_async_rank0(uint32_t remote_addr, float v,
       "r"(__float_as_uint(v)), "r"(remote_bar)
       : "memory");
 }
+// 16-byte remote store into another CTA's smem, completing 16 tx-bytes on its mbarrier.
+__device__ __forceinline__ void st_async_v4_rank_if(bool pred, uint32_t remote_addr, float a,
+                                                    float b, float c, float d,
+                                                    uint32_t remote_bar) {
+  asm volatile(
+      "{\n.reg .pred p;\nsetp.ne.b32 p, %6, 0;\n"
+      "@p st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, "
+      "[%5];\n}\n" ::"r"(remote_addr),
+      "r"(__float_as_uint(a)), "r"(__float_as_uint(b)), "r"(__float_as_uint(c)),
+      "r"(__float_as_uint(d)), "r"(remote_bar), "r"(static_cast<int>(pred))
+      : "memory");
+}
 __device__ __forceinline__ void mbar_wait_parity0(uint32_t bar) {
   asm volatile(
       "{\n"
@@ -185,6 +239,109 @@ __device__ __forceinline__ void mbar_wait_parity0(uint32_t bar) {
       "@!p bra WAIT_%=;\n"
       "}\n" ::"r"(bar)
       : "memory");
+}
+
+__device__ __forceinline__ void named_bar_sync(int id, int nthreads) {
+  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(nthreads) : "memory");
+}
+
+// kFB gate warp: decays of gate features [v_base, v_base + R) of head h for token b,
+// broadcast into s_decay of every CTA of the cluster (st.async, completing on s_bar_g).
+// Lane (gq, tq): tile tq >> 1, row gq + 8 * (tq & 1) of the tile's m16 accumulator.
+template <int C, bool kLowerBound, bool kPrefetch>
+__device__ __forceinline__ void gate_warp(const KdaSplitParams& p, int h, int b, int v_base,
+                                          int lane, uint32_t s_decay_addr, uint32_t bar_addr) {
+  constexpr int R = kD / C;
+  constexpr int kFT = (R + 15) / 16;  // m16 tiles (R = 8: half a tile)
+  const int gq = lane >> 2, tq = lane & 3;
+  const int frow = 16 * (tq >> 1) + gq + 8 * (tq & 1);
+  const bool has_f = (tq >> 1) < kFT && frow < R;
+  if constexpr (!kPrefetch) pdl_wait();
+  // W_fb fragments, rows v_base + 16 t + gq (+ 8).  Slot order inside each 16-wide k chunk
+  // is permuted consistently in A and B (lane tq feeds k = 16c+4tq..+3): mma results are
+  // unchanged and the loads are 8 bytes.
+  uint2 wf[kFT][8][2];
+#pragma unroll
+  for (int t = 0; t < kFT; ++t) {
+    const __nv_bfloat16* const wrow =
+        p.w_fb + static_cast<int64_t>(h * kD + v_base + 16 * t + gq) * kD + 4 * tq;
+#pragma unroll
+    for (int cc = 0; cc < 8; ++cc) {
+      wf[t][cc][0] = ldg_nc_u2(wrow + 16 * cc);
+      wf[t][cc][1] = 16 * t + 8 < R ? ldg_nc_u2(wrow + 8 * kD + 16 * cc) : make_uint2(0u, 0u);
+    }
+  }
+  const float dtb = has_f ? p.dt_bias[h * kD + v_base + frow] : 0.0f;
+  const float a_log = p.a_log[h];
+  const float lower_bound = p.lower_bound;
+  const __nv_bfloat16* const fap = p.fa + b * p.fa_row + 4 * tq;
+  K3KDAS_TSG(0);
+  if constexpr (kPrefetch) pdl_wait();
+  K3KDAS_TSG(1);
+  uint2 fa2[8];
+#pragma unroll
+  for (int cc = 0; cc < 8; ++cc) fa2[cc] = *reinterpret_cast<const uint2*>(fap + 16 * cc);
+#ifdef K3KDAS_TIMING
+  if (threadIdx.x == kD && p.ts != nullptr) asm volatile("" ::"r"(fa2[0].x), "r"(fa2[7].y));
+  K3KDAS_TSG(2);
+#endif
+  // g = f_a @ W_fb^T: per tile a chain of 8 mma over the k chunks in order, fp32 from 0
+  float acc[kFT][4];
+#pragma unroll
+  for (int t = 0; t < kFT; ++t) acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
+#pragma unroll
+  for (int cc = 0; cc < 8; ++cc) {
+#pragma unroll
+    for (int t = 0; t < kFT; ++t) {
+      mma_bf16_16816(acc[t], wf[t][cc][0].x, wf[t][cc][1].x, wf[t][cc][0].y, wf[t][cc][1].y,
+                     fa2[cc].x, fa2[cc].y);
+    }
+  }
+  // D (row gq, col 2tq') = acc[0], (row gq + 8, col 2tq') = acc[2]; all columns equal
+  float gsel = (tq & 1) ? acc[0][2] : acc[0][0];
+  if constexpr (kFT > 1) {
+    if (tq >> 1) gsel = (tq & 1) ? acc[1][2] : acc[1][0];
+  }
+  const float graw = __bfloat162float(__float2bfloat16(gsel));  // f_b_proj output is bf16
+#ifdef K3KDAS_TIMING
+  if (threadIdx.x == kD && p.ts != nullptr) asm volatile("" ::"f"(graw));
+  K3KDAS_TSG(3);
+#endif
+  const float exp_a = __expf(a_log);
+  float decay;
+  if constexpr (kLowerBound) {
+    // __expf(lb * sigmoid(exp_a * g_raw)) as kda_decode6.cu computes it, without a branch:
+    // yd = 1 + e^-x >= 1 and the rcp fast path equals 1/yd for yd < 2^126; for finite
+    // yd >= 2^126 both the flushed fast result (0) and the exact subnormal 1/yd give
+    // __expf(lb * r) == 1.0f, so only yd == inf (fast: NaN, exact: 0) needs a select.
+    const float yd = sig_den(exp_a * (graw + dtb));
+    const float rd = yd == __int_as_float(0x7f800000) ? 0.0f : rcp_fast(yd);
+    decay = __expf(lower_bound * rd);
+  } else {
+    decay = __expf(-exp_a * softplus_fast(graw + dtb));
+  }
+  // Broadcast in ONE warp-wide st.async: the CTA's R decays form P = R/4 16-byte packets
+  // and there are C destinations, P * C == 32 for every C, so lane L sends packet L % P
+  // to cluster rank L / P (remote st.async from one warp serialise per instruction, so a
+  // loop over destinations would cost C round trips).  Feature f lives in lane
+  // ((f & 7) << 2) | ((f >> 4) << 1) | ((f >> 3) & 1).
+  constexpr int P = R / 4;
+  static_assert(P * C == 32, "one packet per lane");
+  const int pk = lane % P, dst_rank = lane / P;
+  float v[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const int f = 4 * pk + i;
+    v[i] = __shfl_sync(0xffffffffu, decay, ((f & 7) << 2) | ((f >> 4) << 1) | ((f >> 3) & 1));
+  }
+#ifdef K3KDAS_TIMING
+  if (threadIdx.x == kD && p.ts != nullptr) asm volatile("" ::"f"(v[3]), "f"(decay));
+  K3KDAS_TSG(4);
+#endif
+  const uint32_t dst = s_decay_addr + 4u * static_cast<uint32_t>(v_base + 4 * pk);
+  st_async_v4_rank_if(true, map_rank(dst, dst_rank), v[0], v[1], v[2], v[3],
+                      map_rank(bar_addr, dst_rank));
+  K3KDAS_TSG(5);
 }
 
 // Position of value row v (= 32g + l + 8j, l < 8, j < 4) in the leader's s_o, so that
@@ -231,11 +388,24 @@ __device__ __forceinline__ void shfl_tree(float (&v)[N]) {
 //       straight-line code on selected inputs.
 // C   = CTAs per (token, head) (cluster size); each owns R = 128 / C value rows.
 // LPR = lanes per state row in the update phase (8: 3 shuffle levels, 16: 4, 32: 5).
-template <int NT, int C, int LPR, bool kSD, bool kLowerBound, bool kOnorm, bool kPrefetch>
-__global__ void __launch_bounds__(NT)
+// kFB = fused f_b_proj (fused_kda_decode_fb): the raw gate g[b, h, :] = bf16(f_a[b] @
+//       W_fb[h*128 : h*128+128]^T) is computed in-kernel instead of being loaded.  It
+//       reproduces vLLM's unfused f_b_proj (cuBLAS: nvjet at M=1, cutlass wmma at M>=2)
+//       bit for bit: fp32 accumulation as a chain of 8 mma.m16n8k16 over k in order, from
+//       0, rounded once to bf16 (checked on 21M outputs, M=1..16).  The CTA gets a fifth,
+//       dedicated "gate warp" (tid >= NT): CTA c computes gate features [c*R, c*R+R) (one
+//       m16 tile per 16 features, the token in all 8 n columns; W_fb fragments loaded
+//       before griddepcontrol.wait), turns them into decays and broadcasts those to every
+//       CTA of the cluster with st.async + an mbarrier.  So each SM only pulls R rows of
+//       W_fb, and the gate chain (f_a load -> 8 dependent mma -> decay -> DSMEM) runs on
+//       its own warp, in parallel with the q/k/v conv chain of the 4 main warps.
+template <int NT, int C, int LPR, bool kSD, bool kLowerBound, bool kOnorm, bool kPrefetch,
+          bool kFB = false>
+__global__ void __launch_bounds__(kFB ? NT + 32 : NT)
     kda_split_kernel(const KdaSplitParams p) {
   constexpr bool kHalves = NT == 2 * kD;
   static_assert(NT == kD || kHalves, "NT must be 128 or 256");
+  static_assert(!kFB || NT == kD, "f_b fusion is implemented for 128 threads");
   constexpr int R = kD / C;                  // value rows per CTA
   constexpr int NJ = 32 / LPR;               // float4 k-blocks per lane per row
   constexpr int GROUPS = NT / LPR;           // rows per pass
@@ -271,10 +441,23 @@ __global__ void __launch_bounds__(NT)
   __shared__ float s_v[R];
   __shared__ __align__(16) float s_o[kD];      // leader: the head's 128 outputs, opos order
   __shared__ __align__(8) unsigned long long s_bar;
+  __shared__ __align__(8) unsigned long long s_bar_g;  // kFB: decays from all CTAs
 
   K3KDAS_TS(0);
   if (leader && tid == 0) mbar_init_expect(smem_addr(&s_bar), kD * 4);
-  cluster_arrive_relaxed();  // "started" (+ mbarrier init visible); waited on at sync 1
+  if (kFB && tid == 0) mbar_init_expect(smem_addr(&s_bar_g), kD * 4);
+  cluster_arrive_relaxed();  // "started" (+ mbarrier init visible)
+  // kFB CTAs st.async into each other from the gate warp, so wait for the whole cluster
+  // up front, before any load is in flight.  Plain kernels wait just before
+  // __syncthreads, where it is free.
+  if constexpr (kFB) {
+    cluster_wait();
+    if (tid >= NT) {
+      gate_warp<C, kLowerBound, kPrefetch>(p, h, b, v_base, lane, smem_addr(s_decay),
+                                           smem_addr(&s_bar_g));
+      return;
+    }
+  }
   if constexpr (!kPrefetch) pdl_wait();
 
   // ------------------ independent of the predecessor: loads only ---------------
@@ -284,17 +467,20 @@ __global__ void __launch_bounds__(NT)
   float* const st_head = p.state + static_cast<int64_t>(slot) * p.state_slot +
                          static_cast<int64_t>(h * kD + v_base) * kD;
   float4 hraw[PASSES][NJ];
+  auto load_state = [&]() {
 #pragma unroll
-  for (int ps = 0; ps < PASSES; ++ps) {
-    const int row = ps * GROUPS + grp;
-    if (row < R) {
+    for (int ps = 0; ps < PASSES; ++ps) {
+      const int row = ps * GROUPS + grp;
+      if (row < R) {
 #pragma unroll
-      for (int j = 0; j < NJ; ++j) {
-        hraw[ps][j] = __ldcg(
-            reinterpret_cast<const float4*>(st_head + row * kD + 4 * (gl + LPR * j)));
+        for (int j = 0; j < NJ; ++j) {
+          hraw[ps][j] = __ldcg(
+              reinterpret_cast<const float4*>(st_head + row * kD + 4 * (gl + LPR * j)));
+        }
       }
     }
-  }
+  };
+  load_state();
 
   __nv_bfloat16* const cs = p.cs + static_cast<int64_t>(slot) * p.cs_slot;
   const int hk = h * kD + ch;                  // q/k channel of this thread
@@ -327,7 +513,7 @@ __global__ void __launch_bounds__(NT)
     cv[0] = cv[1] = cv[2] = __float2bfloat16(0.0f);
     wv[0] = wv[1] = wv[2] = wv[3] = 0.0f;
   }
-  const float dtb = p.dt_bias[hk];
+  const float dtb = kFB ? 0.0f : p.dt_bias[hk];
   const float a_log = p.a_log[h];
   float nw = 0.0f;
   if constexpr (kOnorm) {
@@ -335,7 +521,7 @@ __global__ void __launch_bounds__(NT)
   }
   // Addresses of the dependent inputs, formed before the wait.
   const __nv_bfloat16* const xr = p.x + b * p.x_row;
-  const __nv_bfloat16* const gp = p.g + b * kDim + hk;
+  const __nv_bfloat16* const gp = kFB ? nullptr : p.g + b * kDim + hk;
   const __nv_bfloat16* const bp = p.beta + b * p.beta_row + h;
   const __nv_bfloat16* const gatep =
       kOnorm ? p.gate + b * p.gate_row + h * kD + ch : nullptr;
@@ -347,7 +533,8 @@ __global__ void __launch_bounds__(NT)
   const __nv_bfloat16 xa = xr[sa];
   __nv_bfloat16 xk = __float2bfloat16(0.0f);
   if constexpr (!kHalves) xk = xr[kDim + hk];
-  const float graw = __bfloat162float(*gp);
+  float graw = 0.0f;
+  if constexpr (!kFB) graw = __bfloat162float(*gp);
   __nv_bfloat16 xv = __float2bfloat16(0.0f);
   if (has_v) xv = xr[2 * kDim + hv];
   const float beta_raw = __bfloat162float(*bp);
@@ -380,7 +567,8 @@ __global__ void __launch_bounds__(NT)
   const float exp_a = __expf(a_log);
   const float g_arg = exp_a * (graw + dtb);
   // NT 256: the hi half runs the decay sigmoid chain on the output gate instead.
-  const float x_arg = (kHalves && hi) || !kLowerBound ? gate_raw : g_arg;
+  // kFB: the decay arrives from the gate warps; the 5th sigmoid slot does the gate.
+  const float x_arg = kFB || (kHalves && hi) || !kLowerBound ? gate_raw : g_arg;
 #ifdef K3KDAS_TIMING
   if (threadIdx.x == 0 && p.ts != nullptr) asm volatile("" ::"f"(a_acc), "f"(k_acc), "f"(g_arg));
   K3KDAS_TS(10);  // conv sums done
@@ -407,7 +595,10 @@ __global__ void __launch_bounds__(NT)
     if constexpr (!kHalves) ks = k_acc * rk;
     vs = v_acc * rv;
     beta = rb;
-    if constexpr (kLowerBound) {
+    if constexpr (kFB) {
+      decay = 0.0f;  // unused
+      gate = rx;
+    } else if constexpr (kLowerBound) {
       decay = __expf(lower_bound * rx);  // meaningful where x_arg == g_arg
       gate = kHalves ? rx : 0.0f;
       if constexpr (!kHalves) {
@@ -431,7 +622,7 @@ __global__ void __launch_bounds__(NT)
   } else {
     s_q[ch] = as;
     s_k[ch] = ks;
-    s_decay[ch] = decay;
+    if constexpr (!kFB) s_decay[ch] = decay;
   }
   if (has_v) s_v[vi] = vs;
 
@@ -450,9 +641,16 @@ __global__ void __launch_bounds__(NT)
     }
   }
   K3KDAS_TS(8);
-  cluster_wait();  // all CTAs of the cluster started, leader mbarrier initialised
-  K3KDAS_TS(9);
-  __syncthreads();
+  if constexpr (kFB) {
+    // the 4 main warps (the gate warp has exited); the decays are awaited later, just
+    // before their first use, so their arrival overlaps the q/k normalisation
+    K3KDAS_TS(9);
+    named_bar_sync(1, NT);
+  } else {
+    cluster_wait();  // all CTAs of the cluster started, leader mbarrier initialised
+    K3KDAS_TS(9);
+    __syncthreads();
+  }
   K3KDAS_TS(2);
 
   // ------------------ delta-rule update of this thread's rows ------------------
@@ -469,9 +667,13 @@ __global__ void __launch_bounds__(NT)
       const int kb = 4 * (gl + LPR * j);
       const float4 q4 = *reinterpret_cast<const float4*>(s_q + kb);
       const float4 k4 = *reinterpret_cast<const float4*>(s_k + kb);
-      const float4 d4 = *reinterpret_cast<const float4*>(s_decay + kb);
       r_q[j][0] = q4.x * fq; r_q[j][1] = q4.y * fq; r_q[j][2] = q4.z * fq; r_q[j][3] = q4.w * fq;
       r_k[j][0] = k4.x * fk; r_k[j][1] = k4.y * fk; r_k[j][2] = k4.z * fk; r_k[j][3] = k4.w * fk;
+    }
+    if constexpr (kFB) mbar_wait_parity0(smem_addr(&s_bar_g));  // all 128 decays arrived
+#pragma unroll
+    for (int j = 0; j < NJ; ++j) {
+      const float4 d4 = *reinterpret_cast<const float4*>(s_decay + 4 * (gl + LPR * j));
       r_d[j][0] = d4.x; r_d[j][1] = d4.y; r_d[j][2] = d4.z; r_d[j][3] = d4.w;
     }
   }
@@ -593,9 +795,10 @@ __global__ void __launch_bounds__(NT)
   K3KDAS_TS(6);
 }
 
-template <int NT, int C, int LPR, bool kSD, bool kLowerBound, bool kOnorm, bool kPrefetch>
+template <int NT, int C, int LPR, bool kSD, bool kLowerBound, bool kOnorm, bool kPrefetch,
+          bool kFB = false>
 cudaError_t launch_split(const KdaSplitParams& p, int B, cudaStream_t stream) {
-  auto kernel = &kda_split_kernel<NT, C, LPR, kSD, kLowerBound, kOnorm, kPrefetch>;
+  auto kernel = &kda_split_kernel<NT, C, LPR, kSD, kLowerBound, kOnorm, kPrefetch, kFB>;
   if constexpr (C > 8) {
     static const cudaError_t attr_err = cudaFuncSetAttribute(
         kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
@@ -603,7 +806,7 @@ cudaError_t launch_split(const KdaSplitParams& p, int B, cudaStream_t stream) {
   }
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(C, kH, B);
-  config.blockDim = dim3(NT);
+  config.blockDim = dim3(kFB ? NT + 32 : NT);
   config.dynamicSmemBytes = 0;
   config.stream = stream;
   cudaLaunchAttribute attrs[2];
@@ -618,12 +821,12 @@ cudaError_t launch_split(const KdaSplitParams& p, int B, cudaStream_t stream) {
   return cudaLaunchKernelEx(&config, kernel, p);
 }
 
-template <int NT, int C, int LPR>
+template <int NT, int C, int LPR, bool kFB = false>
 cudaError_t dispatch_c(const KdaSplitParams& p, int B, bool sd, bool lb,
                        bool onorm, bool prefetch, cudaStream_t s) {
-#define K3KDAS_L(SD, LB, ON)                                              \
-  return prefetch ? launch_split<NT, C, LPR, SD, LB, ON, true>(p, B, s)   \
-                  : launch_split<NT, C, LPR, SD, LB, ON, false>(p, B, s)
+#define K3KDAS_L(SD, LB, ON)                                                   \
+  return prefetch ? launch_split<NT, C, LPR, SD, LB, ON, true, kFB>(p, B, s)   \
+                  : launch_split<NT, C, LPR, SD, LB, ON, false, kFB>(p, B, s)
   if (sd) {
     if (lb) {
       if (onorm) { K3KDAS_L(true, true, true); } else { K3KDAS_L(true, true, false); }
@@ -728,6 +931,35 @@ cudaError_t dispatch(const KdaSplitParams& p, int B, SplitCfg cfg, bool sd, bool
   }
 }
 
+// fused_kda_decode_fb: 128-thread kernels only.  K3 configuration gets every (C, LPR)
+// tuning variant; other configurations use kDefaultLPR.
+cudaError_t dispatch_fb(const KdaSplitParams& p, int B, SplitCfg cfg, bool sd, bool lb,
+                        bool onorm, bool prefetch, cudaStream_t s) {
+  if (cfg.NT != 128) return cudaErrorInvalidValue;
+  if (sd && lb && onorm && prefetch) {
+    switch (cfg.LPR * 100 + cfg.C) {
+#define K3KDAS_FB(C_, L_) \
+  case L_ * 100 + C_:     \
+    return launch_split<128, C_, L_, true, true, true, true, true>(p, B, s);
+      K3KDAS_FB(4, 8) K3KDAS_FB(8, 8) K3KDAS_FB(16, 8)
+      K3KDAS_FB(4, 16) K3KDAS_FB(8, 16) K3KDAS_FB(16, 16)
+#undef K3KDAS_FB
+      default:
+        break;
+    }
+  }
+  switch (cfg.C) {
+    case 4:
+      return dispatch_c<128, 4, kDefaultLPR, true>(p, B, sd, lb, onorm, prefetch, s);
+    case 8:
+      return dispatch_c<128, 8, kDefaultLPR, true>(p, B, sd, lb, onorm, prefetch, s);
+    case 16:
+      return dispatch_c<128, 16, kDefaultLPR, true>(p, B, sd, lb, onorm, prefetch, s);
+    default:
+      return cudaErrorInvalidValue;
+  }
+}
+
 bool prefetch_enabled() {
   static const bool enabled = [] {
     const char* v = std::getenv("K3KDAS_NO_PREFETCH");
@@ -736,10 +968,14 @@ bool prefetch_enabled() {
   return enabled;
 }
 
+// Exactly one of raw_g (fused_kda_decode*) or (f_a, f_b_weight) (fused_kda_decode_fb)
+// is given.
 void fused_kda_decode_impl(
     torch::stable::Tensor const& x, torch::stable::Tensor const& weight,
     std::optional<torch::stable::Tensor> const& bias,
-    torch::stable::Tensor& conv_state, torch::stable::Tensor const& raw_g,
+    torch::stable::Tensor& conv_state, std::optional<torch::stable::Tensor> const& raw_g,
+    std::optional<torch::stable::Tensor> const& f_a,
+    std::optional<torch::stable::Tensor> const& f_b_weight,
     torch::stable::Tensor const& raw_beta, torch::stable::Tensor const& a_log,
     torch::stable::Tensor const& dt_bias,
     torch::stable::Tensor const& state_indices, torch::stable::Tensor& state,
@@ -757,8 +993,9 @@ void fused_kda_decode_impl(
   STD_TORCH_CHECK(
       conv_state.is_cuda() && conv_state.scalar_type() == ScalarType::BFloat16,
       "conv_state must be a CUDA bfloat16 tensor");
-  STD_TORCH_CHECK(raw_g.is_cuda() && raw_g.scalar_type() == ScalarType::BFloat16,
-                  "raw_g must be a CUDA bfloat16 tensor");
+  bool const fb = !raw_g.has_value();
+  STD_TORCH_CHECK(fb == (f_a.has_value() && f_b_weight.has_value()),
+                  "k3kdas: pass either raw_g or (f_a, f_b_weight)");
   STD_TORCH_CHECK(
       raw_beta.is_cuda() && raw_beta.scalar_type() == ScalarType::BFloat16,
       "raw_beta must be a CUDA bfloat16 tensor");
@@ -787,10 +1024,30 @@ void fused_kda_decode_impl(
   STD_TORCH_CHECK(conv_state.dim() == 3 && conv_state.size(1) == 3 * kDim &&
                       conv_state.size(2) == kConvWidth - 1,
                   "conv_state must have shape [slots, 3 * H * 128, 3]");
-  STD_TORCH_CHECK(raw_g.dim() == 4 && raw_g.size(0) == 1 &&
-                      raw_g.size(1) == batch_size && raw_g.size(2) == kH &&
-                      raw_g.size(3) == kD,
-                  "raw_g must have shape [1, B, H, 128]");
+  if (!fb) {
+    STD_TORCH_CHECK(raw_g->is_cuda() && raw_g->scalar_type() == ScalarType::BFloat16,
+                    "raw_g must be a CUDA bfloat16 tensor");
+    STD_TORCH_CHECK(raw_g->dim() == 4 && raw_g->size(0) == 1 &&
+                        raw_g->size(1) == batch_size && raw_g->size(2) == kH &&
+                        raw_g->size(3) == kD,
+                    "raw_g must have shape [1, B, H, 128]");
+    STD_TORCH_CHECK(raw_g->is_contiguous(), "raw_g must be contiguous");
+  } else {
+    STD_TORCH_CHECK(f_a->is_cuda() && f_a->scalar_type() == ScalarType::BFloat16,
+                    "f_a must be a CUDA bfloat16 tensor");
+    STD_TORCH_CHECK(f_a->dim() == 2 && f_a->size(0) == batch_size && f_a->size(1) == kD,
+                    "f_a must have shape [B, 128]");
+    STD_TORCH_CHECK(f_a->stride(1) == 1 && (batch_size == 1 || f_a->stride(0) % 4 == 0) &&
+                        reinterpret_cast<uintptr_t>(f_a->data_ptr()) % 8 == 0,
+                    "f_a must have unit inner stride and 8-byte aligned rows");
+    STD_TORCH_CHECK(f_b_weight->is_cuda() &&
+                        f_b_weight->scalar_type() == ScalarType::BFloat16,
+                    "f_b_weight must be a CUDA bfloat16 tensor");
+    STD_TORCH_CHECK(f_b_weight->dim() == 2 && f_b_weight->size(0) == kDim &&
+                        f_b_weight->size(1) == kD && f_b_weight->is_contiguous() &&
+                        reinterpret_cast<uintptr_t>(f_b_weight->data_ptr()) % 16 == 0,
+                    "f_b_weight must be a contiguous [H * 128, 128] tensor");
+  }
   STD_TORCH_CHECK(raw_beta.dim() == 3 && raw_beta.size(0) == 1 &&
                       raw_beta.size(1) == batch_size && raw_beta.size(2) == kH,
                   "raw_beta must have shape [1, B, H]");
@@ -820,7 +1077,6 @@ void fused_kda_decode_impl(
   STD_TORCH_CHECK(state.stride(0) % 4 == 0 &&
                       reinterpret_cast<uintptr_t>(state.data_ptr()) % 16 == 0,
                   "k3kdas: state slots must be 16-byte aligned");
-  STD_TORCH_CHECK(raw_g.is_contiguous(), "raw_g must be contiguous");
   STD_TORCH_CHECK(raw_beta.stride(2) == 1,
                   "raw_beta must be contiguous in its head dimension");
   STD_TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
@@ -874,7 +1130,10 @@ void fused_kda_decode_impl(
   p.bias = bias_ptr;
   p.cs = static_cast<__nv_bfloat16*>(conv_state.data_ptr());
   p.a_log = static_cast<const float*>(a_log.data_ptr());
-  p.g = static_cast<const __nv_bfloat16*>(raw_g.data_ptr());
+  p.g = fb ? nullptr : static_cast<const __nv_bfloat16*>(raw_g->data_ptr());
+  p.fa = fb ? static_cast<const __nv_bfloat16*>(f_a->data_ptr()) : nullptr;
+  p.fa_row = fb ? f_a->stride(0) : 0;
+  p.w_fb = fb ? static_cast<const __nv_bfloat16*>(f_b_weight->data_ptr()) : nullptr;
   p.dt_bias = static_cast<const float*>(dt_bias.data_ptr());
   p.beta = static_cast<const __nv_bfloat16*>(raw_beta.data_ptr());
   p.gate = static_cast<const __nv_bfloat16*>(output_gate_ptr);
@@ -912,8 +1171,12 @@ void fused_kda_decode_impl(
 
   torch::stable::accelerator::DeviceGuard const device_guard(x.get_device_index());
   cudaStream_t const stream = get_current_cuda_stream(x.get_device_index());
-  cudaError_t err = dispatch(p, batch_size, cfg, sd, lower_bound.has_value(), apply_onorm,
-                             prefetch, stream);
+  STD_TORCH_CHECK(!fb || cfg.NT == 128, "k3kdas: fused_kda_decode_fb needs 128 threads");
+  cudaError_t err =
+      fb ? dispatch_fb(p, batch_size, cfg, sd, lower_bound.has_value(), apply_onorm, prefetch,
+                       stream)
+         : dispatch(p, batch_size, cfg, sd, lower_bound.has_value(), apply_onorm, prefetch,
+                    stream);
   if (err == cudaSuccess) err = cudaGetLastError();
   STD_TORCH_CHECK(err == cudaSuccess,
                   "k3kdas KDA decode launch failed: ", cudaGetErrorString(err));
@@ -929,8 +1192,8 @@ void fused_kda_decode(
     torch::stable::Tensor& out, std::optional<double> lower_bound,
     std::optional<torch::stable::Tensor> output_gate,
     std::optional<torch::stable::Tensor> norm_weight, double norm_eps) {
-  fused_kda_decode_impl(x, weight, bias, conv_state, raw_g, raw_beta, a_log,
-                        dt_bias, state_indices, state, out, lower_bound,
+  fused_kda_decode_impl(x, weight, bias, conv_state, raw_g, std::nullopt, std::nullopt,
+                        raw_beta, a_log, dt_bias, state_indices, state, out, lower_bound,
                         output_gate, norm_weight, norm_eps, 0);
 }
 
@@ -947,8 +1210,30 @@ void fused_kda_decode_split(
     std::optional<torch::stable::Tensor> output_gate,
     std::optional<torch::stable::Tensor> norm_weight, double norm_eps,
     int64_t split) {
-  fused_kda_decode_impl(x, weight, bias, conv_state, raw_g, raw_beta, a_log,
-                        dt_bias, state_indices, state, out, lower_bound,
+  fused_kda_decode_impl(x, weight, bias, conv_state, raw_g, std::nullopt, std::nullopt,
+                        raw_beta, a_log, dt_bias, state_indices, state, out, lower_bound,
+                        output_gate, norm_weight, norm_eps, split);
+}
+
+// fused_kda_decode with the KDA gate up-projection folded in: instead of raw_g
+// (= f_b_proj(f_a) as [1, B, H, 128]) it takes the low-rank activations f_a [B, 128]
+// (any row stride, e.g. the f_a slice of in_proj_qkvgfab's output) and f_b_proj's
+// TP-local weight [H * 128, 128]; results are bit-identical to f_b_proj (cuBLAS) +
+// fused_kda_decode.  split as in fused_kda_decode_split (128-thread variants only).
+void fused_kda_decode_fb(
+    torch::stable::Tensor const& x, torch::stable::Tensor const& weight,
+    std::optional<torch::stable::Tensor> bias,
+    torch::stable::Tensor& conv_state, torch::stable::Tensor const& f_a,
+    torch::stable::Tensor const& f_b_weight,
+    torch::stable::Tensor const& raw_beta, torch::stable::Tensor const& a_log,
+    torch::stable::Tensor const& dt_bias,
+    torch::stable::Tensor const& state_indices, torch::stable::Tensor& state,
+    torch::stable::Tensor& out, std::optional<double> lower_bound,
+    std::optional<torch::stable::Tensor> output_gate,
+    std::optional<torch::stable::Tensor> norm_weight, double norm_eps,
+    int64_t split) {
+  fused_kda_decode_impl(x, weight, bias, conv_state, std::nullopt, f_a, f_b_weight,
+                        raw_beta, a_log, dt_bias, state_indices, state, out, lower_bound,
                         output_gate, norm_weight, norm_eps, split);
 }
 
@@ -974,6 +1259,13 @@ K3KDAS_LIB(K3KDAS_NS, m) {
       "Tensor state_indices, Tensor! state, Tensor! out, "
       "float? lower_bound=None, Tensor? output_gate=None, "
       "Tensor? norm_weight=None, float norm_eps=1e-5, int split=0) -> ()");
+  m.def(
+      "fused_kda_decode_fb("
+      "Tensor x, Tensor weight, Tensor? bias, Tensor! conv_state, "
+      "Tensor f_a, Tensor f_b_weight, Tensor raw_beta, Tensor A_log, Tensor dt_bias, "
+      "Tensor state_indices, Tensor! state, Tensor! out, "
+      "float? lower_bound=None, Tensor? output_gate=None, "
+      "Tensor? norm_weight=None, float norm_eps=1e-5, int split=0) -> ()");
 #ifdef K3KDAS_TIMING
   m.def("set_ts(Tensor! ts) -> ()");
   m.def("check_rcp(Tensor! counts) -> ()");
@@ -983,6 +1275,7 @@ K3KDAS_LIB(K3KDAS_NS, m) {
 K3KDAS_LIB_IMPL(K3KDAS_NS, CUDA, m) {
   m.impl("fused_kda_decode", TORCH_BOX(&fused_kda_decode));
   m.impl("fused_kda_decode_split", TORCH_BOX(&fused_kda_decode_split));
+  m.impl("fused_kda_decode_fb", TORCH_BOX(&fused_kda_decode_fb));
 #ifdef K3KDAS_TIMING
   m.impl("set_ts", TORCH_BOX(&set_ts));
   m.impl("check_rcp", TORCH_BOX(&check_rcp));

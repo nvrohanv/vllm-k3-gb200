@@ -18,7 +18,11 @@ events = json.load(gzip.open(path, "rt"))["traceEvents"]
 kernels = sorted((e for e in events if e.get("ph") == "X" and e.get("cat") in ("kernel", "gpu_memcpy")),
                  key=lambda e: e["ts"])
 main_tid = collections.Counter(e["tid"] for e in kernels).most_common(1)[0][0]
-main = [e for e in kernels if e["tid"] == main_tid]
+# Step marker: the embedding kernel, which may run on another stream than the
+# graph-replay main stream. Mark the first main-stream kernel after each one.
+emb_ts = [e["ts"] for e in kernels if "vocab_parallel_embedding" in e["name"]]
+main = [e for e in kernels if e["tid"] == main_tid or "vocab_parallel_embedding" in e["name"]]
+main.sort(key=lambda e: e["ts"])
 marks = [i for i, e in enumerate(main) if "vocab_parallel_embedding" in e["name"]]
 
 

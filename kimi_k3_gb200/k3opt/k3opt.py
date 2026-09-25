@@ -493,9 +493,15 @@ def register():
     if _flag("K3OPT_TAILATTN"):
         from tailattn_patch import patch_tailattn
         patch_tailattn(_load_ext)
+    if _flag("K3OPT_KDA6") and _flag("K3OPT_KDAFB"):
+        from kda_fb_patch import patch_kda_fb
+        patch_kda_fb(_load_ext)
     if _flag("K3OPT_MLA"):
         from mla_patch import patch_mla
         patch_mla(_load_ext)
+    if _flag("K3OPT_OPROJ"):
+        from oproj_patch import patch_oproj
+        patch_oproj(_load_ext)
     if _flag("K3OPT_L2PF"):
         from l2pf_patch import patch_l2pf
         patch_l2pf(_load_ext)
