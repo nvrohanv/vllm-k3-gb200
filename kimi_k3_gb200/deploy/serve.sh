@@ -12,7 +12,7 @@ done < ${CFG}/env.txt
 for plugin in k3snap k3opt; do
   if [[ -f "${CFG}/${plugin}.py" ]]; then
     mkdir -p "/tmp/${plugin}" && cp "${CFG}/${plugin}.py" "/tmp/${plugin}/"
-    [[ "${plugin}" == k3opt ]] && cp "${CFG}/tailattn_patch.py" "/tmp/${plugin}/"
+    [[ "${plugin}" == k3opt ]] && cp "${CFG}/tailattn_patch.py" "${CFG}/mla_patch.py" "/tmp/${plugin}/"
     cp "${CFG}/${plugin}_setup.py" "/tmp/${plugin}/setup.py"
     pip install -q --no-deps --no-build-isolation --root-user-action=ignore "/tmp/${plugin}"
   fi
@@ -25,7 +25,7 @@ if [[ -f ${CFG}/k3opt_build.py ]]; then
   # A build killed mid-way leaves torch's file lock behind and every later
   # build waits on it forever; this is the only builder in the pod.
   rm -f "${TORCH_EXTENSIONS_DIR:-/root/.cache/torch_extensions}"/*/*/lock
-  if env | grep -qE '^K3OPT_(KDA6|ATTN_RES|MOEFUSED|ARRES|TAILATTN)=1'; then
+  if env | grep -qE '^K3OPT_(KDA6|ATTN_RES|MOEFUSED|ARRES|TAILATTN|MLA)=1'; then
     K3OPT_SRC=/tmp/k3opt/csrc python3 /tmp/k3opt/build.py 2>&1 | tail -2
   fi
 fi

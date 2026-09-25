@@ -272,9 +272,16 @@ _fused_state = {}
 def _patch_moe_fused():
     from vllm.model_executor.layers.fused_moe import modular_kernel as mk
     from vllm.model_executor.layers.fused_moe.experts import trtllm_mxfp4_moe as fi_moe
+    from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
 
     _load_ext()
     max_m = int(os.environ.get("K3OPT_MOEFUSED_MAX_M", "2"))
+    seen = set()
+
+    def _count_moefused(m):
+        if m not in seen:
+            seen.add(m)
+            print(f"[k3opt] K3OPT_MOEFUSED: first unfinalized fused MoE call at M={m}", flush=True)
     Impl = mk.FusedMoEKernelMonolithicImpl
     orig_apply = Impl.apply
 
@@ -283,7 +290,21 @@ def _patch_moe_fused():
               e_score_correction_bias=None, routed_scaling_factor=None, topk_group=None):
         experts = self.fused_experts
         m = hidden_states.shape[0]
-        if (router_logits.dtype != torch.int32 or not 1 <= m <= max_m
+        stash = _fused_state.pop("route", None)
+        if stash is not None and stash[0].shape[0] == m and router_logits.dtype != torch.int32:
+            routed = stash
+        elif router_logits.dtype == torch.int32:
+            topk = router_logits.shape[-1] // 2
+            # Explicit dense [m, topk] buffers: at m=1 .contiguous() would keep the
+            # packed row stride, which the MoE-tail CuTe kernels reject.
+            ids = torch.empty((m, topk), dtype=torch.int32, device=hidden_states.device)
+            ids.copy_(router_logits[:, :topk])
+            wts = torch.empty((m, topk), dtype=torch.bfloat16, device=hidden_states.device)
+            wts.copy_(router_logits[:, topk:].view(torch.float32))
+            routed = (ids, wts)
+        else:
+            routed = None
+        if (routed is None or not 1 <= m <= max_m
                 or not isinstance(experts, fi_moe.TrtLlmMxfp4ExpertsMonolithic)
                 or w1.shape[1:] != (512, 1792) or w2.shape[1:] != (3584, 128)):
             return orig_apply(self, hidden_states, w1, w2, router_logits, activation,
@@ -299,35 +320,73 @@ def _patch_moe_fused():
             betas = (float(experts.gemm1_alpha[0]) if experts.gemm1_alpha is not None else 4.0,
                      float(experts.gemm1_beta[0]) if experts.gemm1_beta is not None else 25.0)
             _fused_state[id(experts)] = betas
-        topk = router_logits.shape[-1] // 2
-        topk_ids = router_logits[:, :topk].contiguous()
-        topk_weights = router_logits[:, topk:].contiguous().view(torch.float32)
-        workspace = torch.empty(m * topk * 192, dtype=torch.float16, device=hidden_states.device)
-        out = torch.empty(m, 3584, dtype=torch.bfloat16, device=hidden_states.device)
-        torch.ops.k3moe.moe_fused(
-            hidden_states.contiguous(), topk_ids, topk_weights, w1.view(torch.uint8),
-            experts.w1_scale.view(torch.uint8), w2.view(torch.uint8),
-            experts.w2_scale.view(torch.uint8), workspace, _fused_state["barrier"], out,
-            betas[0], betas[1],
-        )
-        return out
+        topk_ids, topk_weights_bf16 = routed
+        topk = topk_ids.shape[-1]
+        dev = hidden_states.device
+        workspace = torch.empty(m * topk * 192, dtype=torch.float16, device=dev)
+        w = (w1.view(torch.uint8), experts.w1_scale.view(torch.uint8), w2.view(torch.uint8),
+             experts.w2_scale.view(torch.uint8))
+        if not experts.moe_config.should_defer_moe_finalize(m):
+            out = torch.empty(m, 3584, dtype=torch.bfloat16, device=dev)
+            torch.ops.k3moe.moe_fused(hidden_states.contiguous(), topk_ids, topk_weights_bf16.float(), *w,
+                                      workspace, _fused_state["barrier"], out, betas[0], betas[1])
+            return out
+        # Deferred finalize (the K3 MoE-tail does the top-k reduction): hand back the
+        # unweighted per-(token, expert) rows with an identity permute map.
+        ident = _fused_state.get(("ident", m, topk))
+        if ident is None:
+            ident = torch.arange(m * topk, dtype=torch.int32, device=dev).view(m, topk)
+            _fused_state[("ident", m, topk)] = ident
+        gemm2_out = torch.empty(m * topk, 3584, dtype=torch.bfloat16, device=dev)
+        torch.ops.k3moe.moe_fused_unfinalized(hidden_states.contiguous(), topk_ids, *w, workspace,
+                                              _fused_state["barrier"], gemm2_out, betas[0], betas[1])
+        _count_moefused(m)
+        return UnfinalizedMoEOutput(gemm2_permuted=gemm2_out,
+                                    expert_weights=topk_weights_bf16,
+                                    expanded_idx_to_permuted_idx=ident)
 
     Impl.apply = apply
 
-    # The fused kernel finalizes (weights the top-k outputs) itself, so these
-    # batches must take the runner's non-deferred path; the K3 MoE-tail kernel
-    # accepts a finalized routed output there.
-    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+    if not _flag("K3OPT_ROUTE"):
+        # Top-k for small batches only, computed next to the gate GEMM while the
+        # latent down-projection runs on the aux stream, and handed to apply()
+        # through _fused_state (same layer, same Python call order under capture).
+        from vllm.models.kimi_k3.nvidia import model as k3_model
 
-    orig_defer = FusedMoEConfig.should_defer_moe_finalize
+        KimiMoE = k3_model.KimiMoE
+        orig_overlap = KimiMoE._maybe_overlap_router_and_down_proj
 
-    def should_defer_moe_finalize(self, num_tokens):
-        if 1 <= num_tokens <= max_m:
-            return False
-        return orig_defer(self, num_tokens)
+        def _maybe_overlap_router_and_down_proj(self, hidden_states):
+            if self.use_mega_moe or not 1 <= hidden_states.shape[0] <= max_m:
+                return orig_overlap(self, hidden_states)
+            gate = self.gate
 
-    FusedMoEConfig.should_defer_moe_finalize = should_defer_moe_finalize
-    print(f"[k3opt] K3OPT_MOEFUSED: fused MXFP4 MoE kernel for M<={max_m}", flush=True)
+            def gate_and_topk(x):
+                logits = gate.__class__.forward(gate, x)
+                topk_weights, topk_ids = k3_model.fused_grouped_topk(
+                    hidden_states=x, gating_output=logits[0],
+                    topk=getattr(self.experts, "top_k", None) or _TOPK,
+                    renormalize=self.moe_renormalize,
+                    e_score_correction_bias=gate.e_score_correction_bias.data,
+                    num_expert_group=self.num_expert_group, topk_group=self.topk_group,
+                    scoring_func=self.moe_router_activation_func,
+                    routed_scaling_factor=self.routed_scaling_factor)
+                ids = torch.empty(topk_ids.shape, dtype=torch.int32, device=x.device)
+                wts = torch.empty(topk_weights.shape, dtype=torch.bfloat16, device=x.device)
+                ids.copy_(topk_ids)
+                wts.copy_(topk_weights)
+                _fused_state["route"] = (ids, wts)
+                return logits
+
+            self.gate.forward = gate_and_topk
+            try:
+                return orig_overlap(self, hidden_states)
+            finally:
+                del self.gate.forward
+
+        KimiMoE._maybe_overlap_router_and_down_proj = _maybe_overlap_router_and_down_proj
+    print(f"[k3opt] K3OPT_MOEFUSED: fused MXFP4 MoE kernel for M<={max_m}"
+          f"{'' if _flag('K3OPT_ROUTE') else ' (small-M routing in the router branch)'}", flush=True)
 
 
 _ar_state = {}
@@ -427,3 +486,6 @@ def register():
     if _flag("K3OPT_TAILATTN"):
         from tailattn_patch import patch_tailattn
         patch_tailattn(_load_ext)
+    if _flag("K3OPT_MLA"):
+        from mla_patch import patch_mla
+        patch_mla(_load_ext)
