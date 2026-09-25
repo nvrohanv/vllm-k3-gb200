@@ -1,7 +1,9 @@
 # Recipe gb200/multi_node_tp command (recipes.vllm.ai/moonshotai/Kimi-K3/hw/gb200.json)
 --trust-remote-code
+# 0.90 (recipe: 0.95): the k3opt patches allocate after vLLM's memory profiling; at 0.95 a 14k-token
+# prefill step OOMed (see STATUS.md). Decode speed is unaffected.
 --gpu-memory-utilization
-0.95
+0.90
 --tensor-parallel-size
 16
 --load-format
