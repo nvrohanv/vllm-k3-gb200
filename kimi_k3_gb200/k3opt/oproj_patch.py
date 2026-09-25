@@ -78,7 +78,7 @@ def _disabled() -> bool:
 
 
 def _count(key: str) -> None:
-    _STATE["stats"][key] += 1
+    _STATE["stats"][key] = _STATE["stats"].get(key, 0) + 1
 
 
 def stats() -> dict:
@@ -190,24 +190,38 @@ def _post_attn_op(
     eps: float,
     output_norm_eps: float,
     mla: bool = False,
+    xmoe_par: int = -1,
 ) -> torch.Tensor:
     """out = AttnRes(prefix (+)= all_reduce(o_proj(x [* sigmoid(gate)])), blocks, ...) (post-attention).
-    mla: the layer is an MLA layer (only selects the fused / produce+consume dispatch threshold)."""
+    mla: the layer is an MLA layer (only selects the fused / produce+consume dispatch threshold).
+    xmoe_par (W1-3 moefront): >= 0 -> this layer's MoE runs k3mf.moe_block_front for small M; then (and
+    only then, M <= moeblock_patch._FRONT_MAX_M) the consumer also publishes x_moe for it (parity xmoe_par)."""
     M = x.shape[0]
     out = torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=x.device)
+    pub = ()
+    if xmoe_par >= 0:
+        import moeblock_patch
+
+        if M <= moeblock_patch._FRONT_MAX_M:
+            fb = moeblock_patch.front_buffers(x.device)
+            pub = (fb["xmoe"], fb["epoch"], xmoe_par)
     if _kernel_ok(x, gate, weight, prefix, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks):
         mb, mc, mode, rank = _STATE["mailbox"], _STATE["mc"], _STATE["mode"], _STATE["rank"]
+        ops = torch.ops.k3oprojf if pub else torch.ops.k3oproj
         if _k3_paths(M, mla) == "fused":
-            torch.ops.k3oproj.fused(x, weight, gate, mb, mc, buf, rank, mode, prefix, has_delta, blocks,
-                                    norm_weight, qk_weight, output_norm_weight, out, num_blocks, eps,
-                                    output_norm_eps, None)
+            ops.fused(x, weight, gate, mb, mc, buf, rank, mode, prefix, has_delta, blocks, norm_weight, qk_weight,
+                      output_norm_weight, out, num_blocks, eps, output_norm_eps, None, *pub)
             _count("fused")
         else:
             torch.ops.k3oproj.produce(x, weight, gate, mb, mc, buf, rank, mode, None, 44, True, None, None)
-            torch.ops.k3oproj.consume(mb, buf, prefix, has_delta, blocks, norm_weight, qk_weight,
-                                      output_norm_weight, out, None, num_blocks, -1, eps, output_norm_eps)
+            ops.consume(mb, buf, prefix, has_delta, blocks, norm_weight, qk_weight, output_norm_weight, out, None,
+                        num_blocks, -1, eps, output_norm_eps, *pub)
             _count("split")
+        if pub:
+            _count("xmoe_publish")
         return out
+    if pub:  # the front kernel of this layer waits for x_moe: never skip the publish
+        raise RuntimeError("K3MOEFRONT: post-attention fallback path on a front layer (x_moe not published)")
     # Fallback: the original math (gate multiply, o_proj GEMM, TP all-reduce, vLLM attn_res).
     _count("fallback")
     from vllm.models.kimi_k3.nvidia.low_latency_gemm import try_low_latency_gemm
@@ -235,7 +249,7 @@ def _post_attn_op(
 
 @_post_attn_op.register_fake
 def _(x, gate, weight, prefix, has_delta, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks, buf,
-      eps, output_norm_eps, mla=False):
+      eps, output_norm_eps, mla=False, xmoe_par=-1):
     return x.new_empty((x.shape[0], HIDDEN))
 
 
@@ -313,10 +327,23 @@ def install_on_layer(layer) -> bool:
 # --------------------------------------------------------------------------------------------
 def _post_attn_norm(self, hidden_states, residual, prefix_sum):
     pend = self.__dict__.get("_k3oproj_pending")
+    moe = getattr(self, "block_sparse_moe", None)
     if pend is None or pend[0] is not hidden_states:
+        if moe is not None:
+            moe._k3front_expect = False  # W1-3: no x_moe published for this call
         return _STATE["orig_post_attn_norm"](self, hidden_states, residual, prefix_sum)
     self._k3oproj_pending = None
     x, gate = pend
+    xmoe_par = _xmoe_par(self)
+    if moe is not None:
+        # W1-3 per-call hand-off: the MoE forward of THIS call runs the front kernel iff x_moe is published now
+        # (same rule as _post_attn_op: xmoe_par >= 0 and M <= K3MOEFRONT_MAX_M; the op raises if it cannot).
+        pub = False
+        if xmoe_par >= 0:
+            import moeblock_patch
+
+            pub = x.shape[0] <= moeblock_patch._FRONT_MAX_M
+        moe._k3front_expect = pub
     if self.is_block_write_layer:
         # The original makes the all-reduced o_proj output the new prefix_sum (no delta).
         prefix_buf, has_delta = torch.empty((x.shape[0], HIDDEN), dtype=torch.bfloat16, device=x.device), False
@@ -337,8 +364,31 @@ def _post_attn_norm(self, hidden_states, residual, prefix_sum):
         self.mlp_res_norm.variance_epsilon,
         self.post_attention_layernorm.variance_epsilon,
         bool(getattr(self, "_k3oproj_mla", False)),
+        xmoe_par,
     )
     return out, prefix_buf, residual
+
+
+def _xmoe_par(layer) -> int:
+    """W1-3: this layer's parity if its MoE runs the front kernel (moeblock_patch.front_layer_par: K3MOEFRONT=1
+    and the layer is front-eligible), else -1. Static per layer, decided the first time the layer runs (the
+    same point where moeblock_patch builds its per-layer state). _post_attn_norm hands the per-call decision
+    to the MoE forward (moe._k3front_expect), which runs the front kernel exactly when x_moe was published.
+    Deploy with agents/oproj/front/moeblock_patch_merged.py as k3opt/moeblock_patch.py."""
+    p = layer.__dict__.get("_k3xmoe_par")
+    if p is None:
+        p = -1
+        moe = getattr(layer, "block_sparse_moe", None)
+        if moe is not None and getattr(layer, "mlp", None) is moe:
+            try:
+                import moeblock_patch
+
+                if getattr(moeblock_patch, "front_enabled", lambda: False)():
+                    p = moeblock_patch.front_layer_par(moe)
+            except ImportError:
+                p = -1
+        layer._k3xmoe_par = p
+    return p
 
 
 def patch_oproj(load_ext) -> None:

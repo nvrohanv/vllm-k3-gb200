@@ -58,9 +58,13 @@ __device__ __forceinline__ bool mbar_test(uint64_t* bar, uint32_t parity) {
 __device__ __forceinline__ void mbar_wait(uint64_t* bar, uint32_t parity) {
   const uint32_t a = su32(bar);
 #ifdef TC_WAIT_TIMEOUT
-  long n = 0;
+  // time-based (the suspend hint makes an iteration count meaningless): trap after 2 s
+  uint64_t t0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
   while (!mbar_try_wait(a, parity)) {
-    if (++n == (1l << 24)) {
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    if (t - t0 > 2000000000ull) {
       printf("mbar_wait timeout: block %d thread %d bar %p parity %u\n", blockIdx.x, threadIdx.x, bar, parity);
       asm volatile("trap;");
     }
@@ -87,6 +91,22 @@ __device__ __forceinline__ void tma_load_3d(void* dst, const void* map, uint64_t
       "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
       " [%0], [%1, {%3, %4, %5}], [%2];" ::"r"(su32(dst)),
       "l"(map), "r"(su32(bar)), "r"(c0), "r"(c1), "r"(c2)
+      : "memory");
+}
+__device__ __forceinline__ void tma_load_3d_hint(void* dst, const void* map, uint64_t* bar, int c0, int c1, int c2,
+                                                 uint64_t policy) {
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
+      " [%0], [%1, {%3, %4, %5}], [%2], %6;" ::"r"(su32(dst)),
+      "l"(map), "r"(su32(bar)), "r"(c0), "r"(c1), "r"(c2), "l"(policy)
+      : "memory");
+}
+__device__ __forceinline__ void bulk_load_hint(void* dst, const void* src, uint32_t bytes, uint64_t* bar,
+                                               uint64_t policy) {
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;" ::"r"(
+          su32(dst)),
+      "l"(src), "r"(bytes), "r"(su32(bar)), "l"(policy)
       : "memory");
 }
 __device__ __forceinline__ void tma_load_2d_hint(void* dst, const void* map, uint64_t* bar, int c0, int c1,

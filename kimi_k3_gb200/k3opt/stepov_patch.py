@@ -17,6 +17,14 @@ Switches (read at call time unless noted):
   K3STEPOV_EMBED=0         no embedding broadcast (4.)  (checked at graph-capture time)
   K3STEPOV_LMHEAD_PF_MB=N  lm_head L2 prefetch size in MB (default 48; 0 = off) (5.)  (read at
                            l2pf table build time; _GRID / _CHUNK / _POLICY at graph capture)
+  K3STEPOV_PREP_ATTN=0     keep vLLM's gather_block_tables + compute_slot_mappings kernels (3.;
+                           default: folded into k3step.decode_prep_attn when k3step_prep.cu is built)
+  K3STEPOV_FINAL_NORM=0    final RMSNorm stays in compute_logits (6.; read at model construction)
+  K3STEPOV_L0FUSE=1        fuse the layer-0 MLP all-reduce into layer 1's AttnRes (7.; default OFF:
+                           the fused k3ar kernel measured 10.5-12 us per call on 16 ranks, about what
+                           flashinfer's all-reduce + vLLM's AttnRes take in the trace -- A/B only)
+  K3STEPOV_STATE_ALIAS=0   KDA builders keep their own state-index buffers (8.; decided once,
+                           before the first graph capture)
 
 1. TP-distributed Gumbel-max sampling (as step_patch): each rank runs vLLM's own
    ``gumbel_noised_argmax`` over its [M, vocab/16] logits shard with global token ids as noise
@@ -50,6 +58,17 @@ Switches (read at call time unless noted):
    after its FC2 (same side stream / join as l2pf); the CuTe skinny GEMM of the lm_head reads rows
    in block order, so its first third then comes from L2 (~2.5 us of 25 us measured on 1 GPU).
    Nothing changes numerically.
+
+6. Final RMSNorm: applied at the end of KimiLinearModel.forward (inside the CUDA graph, before the
+   l2pf join) and skipped in compute_logits; bit-identical (row-wise).
+7. (opt-in, K3STEPOV_L0FUSE=1) Layer 0 (the dense MLP): its down_proj returns the TP partial and
+   layer 1's pre-attention AttnRes reduces it in k3ar.ar_attn_res (NVLS Lamport all-reduce + AttnRes
+   in one kernel), replacing flashinfer's one-shot all-reduce + vLLM's AttnRes kernel.  Not
+   bit-identical (fp32 rank-order sum, like K3OPT_ARRES: 99.99% of outputs identical, worst rel.
+   error 1.6e-3 on 16 ranks).
+8. KDA metadata builders: their persistent state-index buffers alias the align context's aligned
+   state indices, so the per-step staging copy (one device-to-device copy per KDA KV-cache group,
+   3 at TP16) is a no-op view copy.  Identical memory contents.
 
 Everything that decides between the fast and the original path depends only on state replicated on
 all TP ranks (scheduler output, request sampling params, batch shape), so all ranks always take the
@@ -98,11 +117,13 @@ _STATE = {
     "stats": {"dist_sample": 0, "sample_fallback": 0, "fused_post": 0, "fast_gather": 0,
               "gather_fallback": 0, "embed_bcast": 0, "embed_fallback": 0},
     "reported": set(),
+    "capture_seen": False,  # a CUDA-graph capture of the forward has started (set by the hooks)
 }
 _EMB = {"init": None, "mb": None, "mc": 0, "rank": 0, "tp": 1, "mode": 0}
-_PREP = {"pad": None, "idx": None, "qsl": None, "meta": {}, "installed": False,
+_PREP = {"pad": None, "idx": None, "qsl": None, "meta": {}, "installed": False, "attn_ready": None,
          "stats": {"pad_hit": 0, "pad_miss": 0, "idx_hit": 0, "idx_miss": 0, "qsl_hit": 0,
-                   "qsl_miss": 0, "meta_hit": 0, "meta_miss": 0, "decode_prep": 0}}
+                   "qsl_miss": 0, "meta_hit": 0, "meta_miss": 0, "decode_prep": 0,
+                   "decode_prep_attn": 0}}
 _LMH: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()  # KimiLinearModel -> lm_head ref
 
 
@@ -555,10 +576,35 @@ def _k3sov_qsl(runner, query_start_loc_np, buf):
     _PREP["stats"]["qsl_miss"] += 1
 
 
+def _bt_layout_ok(runner, num_tokens_after_padding) -> bool:
+    """BlockTables of this runner can be served by k3step.decode_prep_attn."""
+    bt = getattr(runner, "block_tables", None)
+    if bt is None:
+        return False
+    ok = getattr(bt, "_k3sov_ok", None)
+    if ok is None:
+        try:
+            g = bt.num_kv_cache_groups
+            ok = (1 <= g <= 8 and bt.cp_size == 1 and bt.slot_mappings.dtype == torch.int64
+                  and bt.slot_mappings.dim() == 2 and bt.slot_mappings.stride(1) == 1
+                  and bt.num_blocks.gpu.dtype == torch.int32 and bt.num_blocks.gpu.stride(1) == 1
+                  and all(t.dtype == torch.int32 and t.gpu.stride(1) == 1 for t in bt.block_tables)
+                  and all(t.dtype == torch.int32 and t.stride(1) == 1 for t in bt.input_block_tables)
+                  and all(a.gpu.stride(0) == b.stride(0) for a, b in zip(bt.block_tables,
+                                                                         bt.input_block_tables)))
+        except Exception:  # noqa: BLE001
+            ok = False
+        bt._k3sov_ok = ok
+    return bool(ok) and num_tokens_after_padding <= bt.slot_mappings.shape[1]
+
+
 def _k3sov_decode_prep(runner, idx_mapping, query_start_loc, cu_num_logits, total_num_logits,
-                       total_num_draft_tokens):
-    """k3step.decode_prep (= prepare_pos_seq_lens + combine_sampled_and_draft_tokens) when there
-    are no draft tokens; returns logits_indices, or None to run vLLM's two kernels."""
+                       total_num_draft_tokens, num_reqs_padded=None, num_tokens_after_padding=None):
+    """Without draft tokens: k3step.decode_prep_attn (= prepare_pos_seq_lens +
+    combine_sampled_and_draft_tokens + BlockTables.gather_block_tables + compute_slot_mappings; the
+    following prepare_attn then launches nothing) or k3step.decode_prep (the first two only).
+    Returns logits_indices, or None to run vLLM's kernels."""
+    _PREP["attn_ready"] = None
     if not (_on("K3STEPOV_DECODE_PREP") and hasattr(torch.ops.k3step, "decode_prep")
             and _prep_ok(runner) and total_num_draft_tokens == 0
             and getattr(runner.model_state, "num_new_sampled_tokens_per_step", None) == 1
@@ -566,11 +612,42 @@ def _k3sov_decode_prep(runner, idx_mapping, query_start_loc, cu_num_logits, tota
         return None
     rs, ib = runner.req_states, runner.input_buffers
     li = torch.empty(total_num_logits, dtype=torch.int64, device=idx_mapping.device)
+    if (_on("K3STEPOV_PREP_ATTN") and hasattr(torch.ops.k3step, "decode_prep_attn")
+            and num_reqs_padded is not None and num_tokens_after_padding is not None
+            and num_reqs_padded >= idx_mapping.shape[0] and num_reqs_padded <= ib.seq_lens.shape[0]
+            and _bt_layout_ok(runner, num_tokens_after_padding)):
+        from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+        bt = runner.block_tables
+        torch.ops.k3step.decode_prep_attn(
+            idx_mapping, query_start_loc, rs.num_computed_tokens.gpu, rs.last_sampled_tokens,
+            rs.prefill_len.gpu, cu_num_logits, ib.positions, ib.seq_lens, ib.input_ids, li,
+            int(num_reqs_padded), bt.block_table_ptrs, bt.input_block_table_ptrs,
+            bt.block_table_strides, bt.num_blocks.gpu, bt.kernel_block_sizes_tensor,
+            bt.slot_mapping_enabled, bt.slot_mappings, int(PAD_SLOT_ID))
+        _PREP["attn_ready"] = (idx_mapping, int(num_reqs_padded), int(num_tokens_after_padding))
+        _PREP["stats"]["decode_prep_attn"] += 1
+        return li
     torch.ops.k3step.decode_prep(idx_mapping, query_start_loc, rs.num_computed_tokens.gpu,
                                  rs.last_sampled_tokens, rs.prefill_len.gpu, cu_num_logits,
                                  ib.positions, ib.seq_lens, ib.input_ids, li)
     _PREP["stats"]["decode_prep"] += 1
     return li
+
+
+def _prepare_attn(self, input_batch):
+    """GPUModelRunner.prepare_attn: block tables and slot mappings were already produced by
+    k3step.decode_prep_attn for exactly this batch -> return vLLM's views without launching."""
+    r = _PREP.get("attn_ready")
+    _PREP["attn_ready"] = None
+    if (r is not None and r[0] is input_batch.idx_mapping
+            and r[1] == input_batch.num_reqs_after_padding
+            and r[2] == input_batch.num_tokens_after_padding
+            and getattr(self, "pcp_manager", None) is None):
+        bt = self.block_tables
+        return (tuple(t[: r[1]] for t in bt.input_block_tables),
+                bt.slot_mappings[:, : r[2]])
+    return _STATE["orig"]["prepare_attn"](self, input_batch)
 
 
 # (old lines, new lines): matched line by line ignoring indentation; the replacement takes the
@@ -594,7 +671,7 @@ _PREP_EDITS = [
      ["_k3sov_qsl(self, query_start_loc_np, query_start_loc)"]),
     (["prepare_pos_seq_lens("],
      ["_k3sov_li = _k3sov_decode_prep(self, idx_mapping, query_start_loc, cu_num_logits, "
-      "total_num_logits, total_num_draft_tokens)",
+      "total_num_logits, total_num_draft_tokens, num_reqs_padded, num_tokens_after_padding)",
       "if _k3sov_li is None: prepare_pos_seq_lens("]),
     (["logits_indices = combine_sampled_and_draft_tokens("],
      ["logits_indices = _k3sov_li if _k3sov_li is not None else combine_sampled_and_draft_tokens("]),
@@ -652,6 +729,8 @@ def _install_prepare_inputs() -> bool:
     newfn.__doc__ = fn.__doc__
     _STATE["orig"]["prepare_inputs"] = fn
     mr.GPUModelRunner.prepare_inputs = newfn
+    _STATE["orig"]["prepare_attn"] = mr.GPUModelRunner.prepare_attn
+    mr.GPUModelRunner.prepare_attn = _prepare_attn
     _PREP["installed"] = True
     return True
 
@@ -726,6 +805,8 @@ def _embed_static_ok(et) -> bool:
 
 def _embed_input_ids(self, input_ids):
     orig = _STATE["orig"]["embed_input_ids"]
+    if _capturing():
+        _STATE["capture_seen"] = True
     et = getattr(self, "embed_tokens", None)
     if (not _on("K3STEPOV_EMBED") or et is None or not isinstance(input_ids, torch.Tensor)
             or input_ids.dim() != 1 or not (1 <= input_ids.shape[0] <= MAX_M)
@@ -868,6 +949,288 @@ def _install_lmhead_prefetch() -> None:
 
 
 # ==========================================================================================
+# 6. Final RMSNorm inside the model graph
+# ==========================================================================================
+def _install_final_norm() -> None:
+    """KimiLinearModel.forward returns model.norm(hidden_states) and KimiLinearForCausalLM.compute_logits
+    skips its own model.norm -- the same kernel on the same rows (row-wise, so applying it before
+    the logits-row selection changes nothing: bit-identical), but inside the CUDA graph (and inside
+    the lm_head prefetch window) instead of as an eager launch.  Only when the pre-norm hidden states
+    have no other consumer: no speculative decoding (MTP drafts read them), no aux hidden-state
+    layers, last PP rank.  Decided once per model at construction (K3STEPOV_FINAL_NORM=0: off)."""
+    from vllm.models.kimi_k3.nvidia import model as k3_model
+
+    CausalLM, Model = k3_model.KimiLinearForCausalLM, k3_model.KimiLinearModel
+    if "final_norm_init" in _STATE["orig"]:
+        return
+    orig_init = CausalLM.__init__
+
+    @functools.wraps(orig_init)
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        m = getattr(self, "model", None)
+        try:
+            from vllm.distributed import get_pp_group
+
+            vc = getattr(self, "vllm_config", None)
+            ok = (_on("K3STEPOV_FINAL_NORM") and m is not None and vc is not None
+                  and getattr(vc, "speculative_config", None) is None
+                  and get_pp_group().is_last_rank
+                  and not getattr(m, "aux_hidden_state_layers", ())
+                  and isinstance(getattr(m, "norm", None), torch.nn.Module))
+        except Exception:  # noqa: BLE001
+            ok = False
+        if m is not None:
+            m._k3sov_final_norm = bool(ok)
+        if ok:
+            _report("final_norm", "final RMSNorm moved into the model forward (CUDA graph)")
+
+    CausalLM.__init__ = __init__
+    _STATE["orig"]["final_norm_init"] = orig_init
+
+    orig_logits = CausalLM.compute_logits
+
+    @functools.wraps(orig_logits)
+    def compute_logits(self, hidden_states, *args, **kwargs):
+        if getattr(getattr(self, "model", None), "_k3sov_final_norm", False):
+            return self.logits_processor(self.lm_head, hidden_states)
+        return orig_logits(self, hidden_states, *args, **kwargs)
+
+    CausalLM.compute_logits = compute_logits
+    _STATE["orig"]["compute_logits"] = orig_logits
+
+    pf = sys.modules.get("l2pf_patch")
+    if pf is not None and pf._STATE.get("patched") and pf._STATE.get("orig_model_forward"):
+        # inside l2pf's wrapper, i.e. before its side-stream join: the norm runs in the prefetch
+        # window
+        pf._STATE["orig_model_forward"] = _final_norm_wrap(pf._STATE["orig_model_forward"])
+    else:
+        Model.forward = _final_norm_wrap(Model.forward)
+
+
+def _final_norm_wrap(inner):
+    @functools.wraps(inner)
+    def forward(self, *args, **kwargs):
+        out = inner(self, *args, **kwargs)
+        if getattr(self, "_k3sov_final_norm", False) and isinstance(out, torch.Tensor):
+            out = self.norm(out, None)
+        return out
+
+    return forward
+
+
+# ==========================================================================================
+# 7. Layer 0 (dense MLP) -> layer 1: all-reduce fused into layer 1's pre-attention AttnRes
+# ==========================================================================================
+_L0 = {"init": None, "mb": None, "mc": 0, "rank": 0, "tp": 1, "pending": None,
+       "stats": {"fused": 0, "fallback": 0}}
+
+
+def _l0_init(dev) -> bool:
+    """Collective (first eager eligible call on every rank): k3ar mailbox [2, tp, 16, 7168]."""
+    if _L0["init"] is not None:
+        return bool(_L0["init"])
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+    from vllm.distributed import get_tp_group
+
+    tpg = get_tp_group()
+    tp, rank = tpg.world_size, tpg.rank_in_group
+    ok = 1 < tp <= 16 and hasattr(torch.ops, "k3ar") and hasattr(torch.ops.k3ar, "ar_attn_res")
+    mb, mc = None, 0
+    if ok:
+        try:
+            mb = symm_mem.empty((2, tp, MAX_M, 7168), dtype=torch.bfloat16, device=dev)
+            mc = int(symm_mem.rendezvous(mb, tpg.device_group.group_name).multicast_ptr or 0)
+        except Exception as e:  # noqa: BLE001
+            print(f"[k3stepov] layer-0 mailbox setup failed: {e}", flush=True)
+            mc = 0
+    flag = torch.tensor([1 if (ok and mc != 0) else 0], dtype=torch.int32, device=dev)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=tpg.device_group)
+    if int(flag.item()) == 0:
+        _L0["init"] = False
+        print("[k3stepov] layer-0 AR+AttnRes fusion unavailable -> original path", flush=True)
+        return False
+    mb.view(torch.int16).fill_(-32768)  # bf16 -0.0 Lamport sentinels (k3ar protocol)
+    torch.cuda.synchronize()
+    tpg.barrier()
+    _L0.update(init=True, mb=mb, mc=mc, rank=rank, tp=tp)
+    print(f"[k3stepov] layer-0 AR+AttnRes fusion ready (tp={tp})", flush=True)
+    return True
+
+
+def install_local_l0_for_tests(mb, mc, rank, tp):
+    _L0.update(init=True, mb=mb, mc=mc, rank=rank, tp=tp, pending=None)
+
+
+def _l0_mlp_forward(self, x):
+    """KimiMLP.forward of the flagged dense layer: return the down_proj partial (no all-reduce);
+    the next layer's _pre_attn_norm reduces it inside k3ar.ar_attn_res."""
+    orig = _STATE["orig"]["mlp_forward"]
+    _L0["pending"] = None
+    if not (getattr(self, "_k3sov_l0", False) and _on("K3STEPOV_L0FUSE", "0")
+            and isinstance(x, torch.Tensor) and x.dim() == 2 and 1 <= x.shape[0] <= MAX_M
+            and x.dtype == torch.bfloat16 and not torch.compiler.is_compiling()):
+        return orig(self, x)
+    if _L0["init"] is None:
+        if _capturing():
+            return orig(self, x)
+        _l0_init(x.device)
+    if not _L0["init"]:
+        return orig(self, x)
+    gate_up, _ = self.gate_up_proj(x)
+    y = self.act_fn(gate_up)
+    dp = self.down_proj
+    dp.reduce_results = False
+    try:
+        partial, _ = dp(y)
+    finally:
+        dp.reduce_results = True
+    if not (partial.is_contiguous() and partial.shape[1] == 7168):
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        _L0["stats"]["fallback"] += 1
+        return tensor_model_parallel_all_reduce(partial)
+    _L0["pending"] = partial
+    return partial
+
+
+def _l1_pre_attn_norm(self, hidden_states, residual, prefix_sum):
+    p = _L0["pending"]
+    if p is None or hidden_states is not p:
+        return _STATE["orig"]["pre_attn_norm"](self, hidden_states, residual, prefix_sum)
+    _L0["pending"] = None
+    if not (getattr(self, "_k3sov_l1", False) and prefix_sum is not None and residual is not None
+            and prefix_sum.stride(0) == 7168 and residual.stride(-1) == 1
+            and 0 <= self.prev_valid_blocks <= 8):
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        _L0["stats"]["fallback"] += 1
+        return _STATE["orig"]["pre_attn_norm"](self, tensor_model_parallel_all_reduce(p), residual,
+                                               prefix_sum)
+    out = torch.empty_like(p)
+    torch.ops.k3ar.ar_attn_res(
+        p, _L0["mb"], _L0["mc"], 0, _L0["rank"], _L0["tp"], prefix_sum, True, residual,
+        self.self_attention_res_norm.weight, self.self_attention_res_proj.weight.squeeze(0),
+        self.input_layernorm.weight, out, self.prev_valid_blocks,
+        self.block_write_idx if self.is_block_write_layer else -1,
+        self.self_attention_res_norm.variance_epsilon, self.input_layernorm.variance_epsilon)
+    _L0["stats"]["fused"] += 1
+    _report("l0fuse", "layer-0 MLP all-reduce fused into layer 1's AttnRes (k3ar.ar_attn_res)")
+    return out, prefix_sum, residual
+
+
+def _install_l0_fuse() -> None:
+    """Flags (at model construction) the dense layer 0 -> layer 1 pair when: TP > 1, AttnRes, layer 0
+    is a plain KimiMLP (TP-sharded down_proj with reduce_results, no sequence parallel, no GEMM-RS-AR)
+    and nothing reads layer 0's output except layer 1 (no aux hidden-state layers).  One k3ar call per
+    forward uses mailbox buffer 0 only: consecutive calls are separated by the forward's other
+    collectives.  Numerics: fp32 sum of the 16 partials in rank order, one bf16 rounding, then
+    AttnRes (the K3OPT_ARRES kernel); not bit-identical to flashinfer's all-reduce + vLLM's AttnRes
+    kernel.  K3STEPOV_L0FUSE=0: original path."""
+    from vllm.models.kimi_k3.nvidia import model as k3_model
+
+    if "mlp_forward" in _STATE["orig"]:
+        return
+    Model, Layer, MLP = k3_model.KimiLinearModel, k3_model.KimiDecoderLayer, k3_model.KimiMLP
+    orig_init = Model.__init__
+
+    @functools.wraps(orig_init)
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        try:
+            layers = self.layers
+            start = getattr(self, "start_layer", 0)
+            end = getattr(self, "end_layer", len(layers))
+            if end - start < 2 or getattr(self, "aux_hidden_state_layers", ()):
+                return
+            l0, l1 = layers[start], layers[start + 1]
+            mlp = getattr(l0, "mlp", None)
+            dp = getattr(mlp, "down_proj", None)
+            ok = (type(mlp) is MLP and dp is not None and getattr(dp, "reduce_results", False)
+                  and getattr(dp, "tp_size", 1) > 1 and mlp.gemm_rs_ar is None
+                  and not mlp.shard_sequence_parallel
+                  and not getattr(l0, "use_sequence_parallel", False)
+                  and not getattr(l1, "use_sequence_parallel", False)
+                  and getattr(l1, "use_attn_res", False) and getattr(l0, "use_attn_res", False)
+                  and getattr(dp, "output_size", 7168) == 7168)
+            if ok:
+                mlp._k3sov_l0 = True
+                l1._k3sov_l1 = True
+        except Exception as e:  # noqa: BLE001
+            print(f"[k3stepov] layer-0 fusion not installed: {e!r}", flush=True)
+
+    Model.__init__ = __init__
+    _STATE["orig"]["l0_model_init"] = orig_init
+    _STATE["orig"]["mlp_forward"] = MLP.forward
+    MLP.forward = _l0_mlp_forward
+    _STATE["orig"]["pre_attn_norm"] = Layer._pre_attn_norm
+    Layer._pre_attn_norm = _l1_pre_attn_norm
+
+
+# ==========================================================================================
+# 8. KDA state-index staging: alias the builders' persistent buffers to the aligned indices
+# ==========================================================================================
+def _alias_state_indices(ms, attn_groups, kv_cache_config, block_tables) -> None:
+    """Once per model state, before any CUDA graph is captured: point every KDA metadata builder's
+    persistent ``non_spec_state_indices_tensor`` at its row of the align context's
+    ``aligned_state_indices`` [groups, max_reqs, 1] (which get_aligned_state_indices_multi_group
+    writes every step).  The builder's per-step ``copy_`` from that row into its buffer then copies
+    a view onto itself, which PyTorch skips (no kernel): one device-to-device copy per KDA group and
+    step disappears.  Same memory contents at every point the forward reads them."""
+    if getattr(ms, "_k3sov_alias", None) is not None:
+        return
+    ok = False
+    try:
+        if (_on("K3STEPOV_STATE_ALIAS") and not _STATE["capture_seen"] and not _capturing()
+                and getattr(ms, "_align_mode", False) and block_tables is not None):
+            group_ids, _ = ms._get_mamba_group_info(kv_cache_config)
+            ctx = ms._ensure_align_ctx(kv_cache_config, group_ids, block_tables)
+            al = getattr(ctx, "aligned_state_indices", None)
+            if isinstance(al, torch.Tensor) and al.dim() == 3 and al.shape[2] == 1 and al.is_contiguous():
+                n = 0
+                for gi, gid in enumerate(group_ids):
+                    for group in attn_groups[gid]:
+                        b = group.get_metadata_builder(0)
+                        buf = getattr(b, "non_spec_state_indices_tensor", None)
+                        if (not hasattr(b, "mamba_aligned_state_indices") or not isinstance(buf, torch.Tensor)
+                                or buf.dim() != 1 or buf.dtype != al.dtype or buf.device != al.device
+                                or buf.shape[0] > al.shape[1]):
+                            continue
+                        b.non_spec_state_indices_tensor = al[gi, : buf.shape[0], 0]
+                        n += 1
+                ok = n > 0
+                if ok:
+                    print(f"[k3stepov] KDA state-index staging aliased for {n} group builder(s): "
+                          f"no per-step device-to-device copies", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[k3stepov] state-index alias not installed: {e!r}", flush=True)
+        ok = False
+    ms._k3sov_alias = ok
+
+
+def _install_state_alias() -> None:
+    try:
+        from vllm.v1.worker.gpu.model_states import mamba_hybrid as mh
+    except Exception:  # noqa: BLE001
+        return
+    cls = getattr(mh, "MambaHybridModelState", None)
+    if cls is None or "state_alias_prepare_attn" in _STATE["orig"]:
+        return
+    orig = cls.prepare_attn
+
+    @functools.wraps(orig)
+    def prepare_attn(self, input_batch, cudagraph_mode, block_tables, slot_mappings, attn_groups,
+                     kv_cache_config, *args, **kwargs):
+        _alias_state_indices(self, attn_groups, kv_cache_config, block_tables)
+        return orig(self, input_batch, cudagraph_mode, block_tables, slot_mappings, attn_groups,
+                    kv_cache_config, *args, **kwargs)
+
+    _STATE["orig"]["state_alias_prepare_attn"] = orig
+    cls.prepare_attn = prepare_attn
+
+
+# ==========================================================================================
 def patch_stepov(load_ext) -> bool:
     if _on("K3STEPOV_DISABLE", "0"):
         print("[k3stepov] K3STEPOV_DISABLE=1: stepov patch off", flush=True)
@@ -881,6 +1244,13 @@ def patch_stepov(load_ext) -> bool:
     prep = _install_prepare_inputs()
     _install_embed()
     _install_lmhead_prefetch()
+    _install_final_norm()
+    # Install only when enabled: the wrapper replaces KimiDecoderLayer._pre_attn_norm, and tailattn
+    # defers a MoE tail only if that method is still its own (identity check) -- an always-installed
+    # pass-through wrapper silently disabled 91 of 92 tail hand-offs (+0.17-0.25 ms/step).
+    if _on("K3STEPOV_L0FUSE", "0"):
+        _install_l0_fuse()
+    _install_state_alias()
     _STATE["patched"] = True
     print("[k3stepov] patched: distributed sampling + fused post-update, "
           f"input-prep caching {'on' if prep else 'OFF'}, embedding broadcast, lm_head prefetch "
@@ -889,4 +1259,4 @@ def patch_stepov(load_ext) -> bool:
 
 
 def stats() -> dict:
-    return {**_STATE["stats"], **_PREP["stats"]}
+    return {**_STATE["stats"], **_PREP["stats"], **{"l0_" + k: v for k, v in _L0["stats"].items()}}

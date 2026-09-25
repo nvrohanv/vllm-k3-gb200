@@ -34,6 +34,9 @@
 //   x -> MXFP8 is done in every CTA (loads issued during the dedupe); xready[ks] barriers release
 //   the MMA warp per K-stage.
 //
+// Weight loads use an L2 evict-first cache policy (single-use stream; keeps L2 for x / partials / h images and
+// other layers' data): measured M = 8 29.8 -> 27.9 us, M = 4 18.8 -> 18.0 us (-DMOE8_EVICT_NORMAL to disable).
+// x loads are issued after the expert dedupe (-DMOE8_XLOAD_EARLY for the old order).
 // Warp roles (384 threads): w0 TMA producer, w1 MMA issuer, w2 h loader, w3 TMEM owner + h re-arm,
 // w4..7 and w8..11 two epilogue groups (alternate accumulators; TMEM lane quadrant = warp % 4).
 // Warps 2..11 quantize x first.
@@ -84,7 +87,16 @@ constexpr int kOffHq = kOffXq + 28672;               // 2 x 2 KB h (e4m3), B ope
 constexpr int kOffXsf = kOffHq + 2 * 2048;           // 28 x 128 (+384) SFB images of x
 constexpr int kOffHsf = kOffXsf + 28 * 128 + 384;    // 2 x (2 x 128 + 384) SFB images of h
 constexpr int kOffMisc = kOffHsf + 2 * 640;
-constexpr int kSmemBytes = kOffMisc + 5120;
+// MOE8_PF_PARTIAL (opt-in): warp 3 prefetches the remote FC1 partials of this CTA's split owner tile into smem.
+// Measured: owner reduce median 2.05 -> 0.77 us and MMA h-stall p90 2.05 -> 0.77 us at M = 8, but no end-to-end
+// gain (M = 4/8 within noise) and +0.2..0.4 us at M = 1/2 from the extra 16 KB of smem (less L1), so it is off.
+constexpr int kOffPf = kOffMisc + 5120;              // 2 groups x 2 prefetched remote partials (fp32 [8][128])
+constexpr int kPfSlots = 2;
+#ifdef MOE8_PF_PARTIAL
+constexpr int kSmemBytes = kOffPf + 2 * kPfSlots * 4096;
+#else
+constexpr int kSmemBytes = kOffPf;
+#endif
 static_assert(kSmemBytes <= 232448, "smem");
 
 // TMEM columns (all scale-factor bases are multiples of 4)
@@ -113,6 +125,8 @@ struct Misc {
   uint64_t accfull[kAcc], accempty[kAcc];
   uint64_t hfull[2], hempty[2];
   uint64_t xready[kFc1Stages];
+  uint64_t xgo;  // MOE8_XAFTER: the producer has issued its first ring of stages (x loads may start)
+  uint64_t pfbar[2][2];  // remote FC1 partials of this CTA's split owner tile, prefetched into smem by warp 3
   Meta meta[kSlots];
   Meta accmeta[kAcc];
   uint32_t tmem_base;
@@ -213,6 +227,12 @@ __device__ __forceinline__ void trace_ctr(const Params& p, int i, long long v) {
   if (p.trace != nullptr) p.trace[blockIdx.x * 128 + 64 + i] = v;
 }
 
+// Per-tile / per-expert hand-off timestamps (MOE8_TRACE builds): region at trace[20480 ...].
+__device__ __forceinline__ void trace_at(const Params& p, int idx, long long v) {
+#ifdef MOE8_TRACE
+  if (p.trace != nullptr) p.trace[20480 + idx] = v;
+#endif
+}
 __device__ __forceinline__ int split_lo(int c, int total, int G) {
   return static_cast<int>(static_cast<unsigned>(c * total) / static_cast<unsigned>(G));  // < 2^31
 }
@@ -243,6 +263,9 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       tc::mbar_init(&ms.hempty[b], 1);
     }
     for (int k = 0; k < kFc1Stages; ++k) tc::mbar_init(&ms.xready[k], 8 * p.M);
+    tc::mbar_init(&ms.xgo, 1);
+    for (int g = 0; g < 2; ++g)
+      for (int i = 0; i < kPfSlots; ++i) tc::mbar_init(&ms.pfbar[g][i], 1);
     tc::fence_mbar_init();
     tc::prefetch_tmap(&tmA1);
     tc::prefetch_tmap(&tmA2);
@@ -278,7 +301,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
   // Thread xtid, round r: block j = xtid % 64 (token j/8, 32-block j%8) of K-stage 5r + xtid/64.
   const int xtid = static_cast<int>(threadIdx.x) - 64;
   uint4 xraw[3][4];
-  if (warp >= 2) {
+  auto load_x = [&]() {
 #pragma unroll
     for (int r = 0; r < 3; ++r) {
       const int ks = 5 * r + (xtid >> 6), j = xtid & 63, t = j >> 3, kbl = j & 7;
@@ -287,7 +310,10 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
 #pragma unroll
       for (int v = 0; v < 4; ++v) xraw[r][v] = ok ? src[v] : make_uint4(0, 0, 0, 0);
     }
-  }
+  };
+#ifdef MOE8_XLOAD_EARLY
+  if (warp >= 2) load_x();
+#endif
   if (threadIdx.x < npairs) atomicMin(&table[myid], static_cast<int>(threadIdx.x));
   __syncthreads();
   if (threadIdx.x < kMaxPairs) {
@@ -308,6 +334,11 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
     if (i < npairs) ms.tokslot[ms.uof[firstk]][i / kTopK] = static_cast<signed char>(i % kTopK);
   }
   __syncthreads();
+#if !defined(MOE8_XLOAD_EARLY) && !defined(MOE8_XAFTER)
+  // x loads after the dedupe: at M = 8 the 60 KB/CTA of x requests otherwise stall the dedupe's barriers in
+  // the LSU queue; the MMA is gated per K-stage by xready[] anyway.
+  if (warp >= 2) load_x();
+#endif
   asm volatile("griddepcontrol.launch_dependents;");
   if (threadIdx.x == 0) trace_ev(p, 2);
   const int D = ms.D;
@@ -317,7 +348,17 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
 #ifndef MOE8_GROUP_MIN_D
 #define MOE8_GROUP_MIN_D 40
 #endif
-  const int ub[3] = {0, D > MOE8_GROUP_MIN_D ? (D + 1) / 2 : D, D};
+#ifndef MOE8_GROUP_A_PCT
+#define MOE8_GROUP_A_PCT 50
+#endif
+  // group A gets MOE8_GROUP_A_PCT % of the experts: a smaller group B leaves h(B) more slack behind FC2(A)
+  const int ub[3] = {0, D > MOE8_GROUP_MIN_D ? (D * MOE8_GROUP_A_PCT + 99) / 100 : D, D};
+  // remote-partial prefetch (warp 3) only with two expert groups: at M <= 2 it measured slower
+#ifdef MOE8_PF_PARTIAL
+  const bool pf_on = D > MOE8_GROUP_MIN_D;
+#else
+  const bool pf_on = false;
+#endif
   int S1g[2], f1lo[2], f1hi[2], f2lo[2], f2hi[2];
 #pragma unroll
   for (int g = 0; g < 2; ++g) {
@@ -369,6 +410,9 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
         }
         return si;
       };
+#ifndef MOE8_EVICT_NORMAL
+      const uint64_t wpol = tc::policy_evict_first();
+#endif
       for (int n = 0; n < total; ++n) {
         const SInfo si = info(n);
         if (n >= kSlots) {
@@ -380,17 +424,32 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
         if (n == n1a + n1b) trace_ev(p, 6);
         ms.meta[slot] = si.m;
         tc::mbar_expect_tx(&ms.full[slot], 16384 + 1024);
+#ifndef MOE8_EVICT_NORMAL
+        // single-use weight stream: evict-first keeps L2 for x / partials / h images
+        if (si.m.type == kFC1)
+          tc::tma_load_3d_hint(sm + kOffA + slot * 32768, &tmA1, &ms.full[slot], 0, si.row0, si.kc, wpol);
+        else
+          tc::tma_load_3d_hint(sm + kOffA + slot * 32768, &tmA2, &ms.full[slot], 0, si.row0, si.kc, wpol);
+        tc::bulk_load_hint(sm + kOffSFA + slot * 1024, si.sf, 1024, &ms.full[slot], wpol);
+#else
         if (si.m.type == kFC1)
           tc::tma_load_3d(sm + kOffA + slot * 32768, &tmA1, &ms.full[slot], 0, si.row0, si.kc);
         else
           tc::tma_load_3d(sm + kOffA + slot * 32768, &tmA2, &ms.full[slot], 0, si.row0, si.kc);
         tc::bulk_load(sm + kOffSFA + slot * 1024, si.sf, 1024, &ms.full[slot]);
+#endif
+#ifdef MOE8_XAFTER
+        if (n == min(total, MOE8_XAFTER) - 1) tc::mbar_arrive(&ms.xgo);
+#endif
         if (++slot == kSlots) {
           slot = 0;
           phase ^= 1;
         }
       }
       const int uses = total;
+#ifdef MOE8_XAFTER
+      if (total == 0) tc::mbar_arrive(&ms.xgo);
+#endif
       trace_ev(p, 8);
       trace_ctr(p, 0, wait_empty);
       if (uses >= kSlots) tc::mbar_wait(&ms.empty[slot], phase ^ 1);
@@ -401,6 +460,11 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
     tc::tc_fence_after();
     const uint32_t tmem = ms.tmem_base;
     if (warp >= 2) {
+#ifdef MOE8_XAFTER
+      // x loads only after the producer's first TMAs are out (they would otherwise queue behind 60 KB/CTA of x)
+      tc::mbar_wait(&ms.xgo, 0);
+      load_x();
+#endif
       // ================================================================ x -> MXFP8 B operand (warps 2..11)
       // All 14 K-stages, natural order (loads were issued before the dedupe). Each block owner writes
       // its two 16-B chunks and its scale byte, fences, and arrives on xready[ks] (count 8*M).
@@ -547,7 +611,12 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             cur_u = m.a;
             ++hord;
             const long long c1 = PCLK();
+            if (lane == 0 && hord < 8) trace_ctr(p, 32 + hord, static_cast<long long>(tc::globaltimer()));
             tc::mbar_wait(&ms.hfull[hord & 1], (hord >> 1) & 1);
+            if (lane == 0 && hord < 8) {
+              trace_ctr(p, 40 + hord, static_cast<long long>(tc::globaltimer()));
+              trace_ctr(p, 48 + hord, m.a);
+            }
             tc::tc_fence_after();
             w_h += PCLK() - c1;
             if (hord == 0 && lane == 0) trace_ev(p, 11);
@@ -579,6 +648,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           const int b = k & 1;
           if (k >= 2) tc::mbar_wait(&ms.hempty[b], ((k >> 1) - 1) & 1);
           const uint8_t* src = hset + static_cast<long>(u) * kHImg;
+          if (lane == 0 && k < 8) trace_ctr(p, 16 + k, static_cast<long long>(tc::globaltimer()));
           uint4 q[4];
           uint32_t s4;
           for (;;) {
@@ -609,6 +679,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           __syncwarp();
           if (lane == 0) {
             if (k == 0) trace_ev(p, 12);
+            if (k < 8) trace_ctr(p, 24 + k, static_cast<long long>(tc::globaltimer()));
             tc::mbar_arrive(&ms.hfull[b]);
           }
         }
@@ -620,6 +691,50 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       const int lo = split_lo(cta, n16, G), hi = split_lo(cta + 1, n16, G);
       const uint4 ff = make_uint4(~0u, ~0u, ~0u, ~0u);
       for (int i = lo + lane; i < hi; i += 32) other[i] = ff;
+#ifdef MOE8_PF_PARTIAL
+      // ================================================================ prefetch remote FC1 partials
+      // This CTA owns at most one tile per group that continues into the next CTAs' ranges (its last piece).
+      // Those CTAs publish their pieces at the START of their ranges, long before this CTA's owner piece is
+      // done; fetch them into smem now so the owner epilogue does not pay 1-2 loaded L2 round trips.
+      float* pbase_pf = reinterpret_cast<float*>(p.ws + kWsP);
+      for (int g = 0; g < (pf_on ? 2 : 0); ++g) {
+        if (f1hi[g] <= f1lo[g]) continue;
+        const int s0 = ((f1hi[g] - 1) / kFc1Stages) * kFc1Stages;  // first stage of the tile holding my last stage
+        if (s0 < f1lo[g] || s0 + kFc1Stages <= f1hi[g]) continue;   // not an owner, or the tile ends in my range
+        int i = 0;
+        for (int c2 = cta + 1; c2 < G && i < kPfSlots && split_lo(c2, S1g[g], G) < s0 + kFc1Stages; ++c2) {
+          if (split_lo(c2 + 1, S1g[g], G) == split_lo(c2, S1g[g], G)) continue;  // empty range: no piece
+          uint4* src = reinterpret_cast<uint4*>(pbase_pf + (static_cast<long>(g) * kMaxG + c2) * 1024);
+          uint4 v[8];
+          for (;;) {
+            bool bad = false;
+#pragma unroll
+            for (int q = 0; q < 8; ++q) {
+              const int f = lane + 32 * q;  // float4 index: token f / 32, rows 4 (f % 32) .. +3
+              const int t = f >> 5;
+              v[q] = t < M ? ld_volatile_v4(src + f) : make_uint4(0, 0, 0, 0);
+              bad |= (v[q].x == 0xffffffffu) | (v[q].y == 0xffffffffu) | (v[q].z == 0xffffffffu) |
+                     (v[q].w == 0xffffffffu);
+            }
+            if (!__any_sync(0xffffffffu, bad)) break;
+            __nanosleep(64);
+          }
+          uint4* dst = reinterpret_cast<uint4*>(sm + kOffPf + (g * kPfSlots + i) * 4096);
+          const uint4 ff4 = make_uint4(~0u, ~0u, ~0u, ~0u);
+#pragma unroll
+          for (int q = 0; q < 8; ++q) {
+            const int f = lane + 32 * q;
+            if ((f >> 5) < M) {
+              dst[f] = v[q];
+              src[f] = ff4;  // re-arm (the owner no longer touches this slot)
+            }
+          }
+          __syncwarp();
+          if (lane == 0) tc::mbar_arrive(&ms.pfbar[g][i]);
+          ++i;
+        }
+      }
+#endif
     } else if (warp >= 4) {
       // ================================================================ epilogue (two groups of 4 warps;
       // group eg handles accumulators eg, eg + 2, ...; ew = TMEM lane quadrant)
@@ -661,9 +776,22 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             continue;
           }
           if (eg == 0 && ew == 0 && lane == 0 && kTraceOn && p.trace != nullptr && p.trace[cta * 128 + 17] == 0) trace_ev(p, 17);
+          if (ew == 0 && lane == 0 && T < 400) trace_at(p, T, static_cast<long long>(tc::globaltimer()));
           // Other pieces of this tile: CTAs cta+1.. whose ranges start inside the tile.
+          int ipf = 0;
           for (int c2 = cta + 1; c2 < G && split_lo(c2, S1g[g], G) < s0 + kFc1Stages; ++c2) {
             if (split_lo(c2 + 1, S1g[g], G) == split_lo(c2, S1g[g], G)) continue;  // empty range: no piece
+#ifdef MOE8_PF_PARTIAL
+            if (pf_on && ipf < kPfSlots) {  // prefetched by warp 3 (and already re-armed there)
+              tc::mbar_wait(&ms.pfbar[g][ipf], 0);
+              const float* pf = reinterpret_cast<const float*>(sm + kOffPf + (g * kPfSlots + ipf) * 4096) + row;
+#pragma unroll
+              for (int t = 0; t < kMaxM; ++t)
+                if (t < M) v[t] += pf[t * 128];
+              ++ipf;
+              continue;
+            }
+#endif
             float* src = pbase + (static_cast<long>(g) * kMaxG + c2) * 1024 + row;
             float pv[8];
             for (;;) {
@@ -687,6 +815,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
               }
           }
           if (eg == 0 && ew == 0 && lane == 0) trace_ev(p, 24);
+          if (ew == 0 && lane == 0 && T < 400) trace_at(p, 400 + T, static_cast<long long>(tc::globaltimer()));
           const int u = T / 3, r = T % 3;
           float h[8], am[8];
 #pragma unroll
@@ -725,6 +854,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           }
           asm volatile("bar.sync %0, 128;" ::"r"(ebar) : "memory");  // ms.amax / hst reuse
           if (eg == 0 && ew == 0 && lane == 0) trace_ev(p, 18);
+          if (ew == 0 && lane == 0 && T < 400) trace_at(p, 800 + T, static_cast<long long>(tc::globaltimer()));
         } else {
           const int u = m.a, mt = m.b;
           // physical row p -> logical output row 32*(p/32) + 4*(p%8) + (p%32)/8; lanes l and l+8 hold
@@ -837,9 +967,21 @@ void launch(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::
     if (me.w13 == w13.data_ptr() && me.w2 == w2.data_ptr() && me.E == E) mc = &me;
   if (mc == nullptr) {
     MapEntry me;
-    me.a1 = fp4_map(w13.data_ptr(), E * kW13Rows, kW13RowBytes, 28, 64, CU_TENSOR_MAP_L2_PROMOTION_L2_256B);
+#ifndef MOE8_FC2_PROMO
+#define MOE8_FC2_PROMO CU_TENSOR_MAP_L2_PROMOTION_NONE
+#endif
+#ifndef MOE8_FC1_PROMO
+#define MOE8_FC1_PROMO CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+#endif
+    me.a1 = fp4_map(w13.data_ptr(), E * kW13Rows, kW13RowBytes, 28, 64, MOE8_FC1_PROMO);
     // W2: K-chunks at k = 0 and k = 64 (32-B chunk stride), so bytes 96..127 (K padding) are never read.
-    me.a2 = fp4_map(w2.data_ptr(), E * kHidden, 128, 2, 32, CU_TENSOR_MAP_L2_PROMOTION_NONE);
+#ifndef MOE8_FC2_PROMO
+#define MOE8_FC2_PROMO CU_TENSOR_MAP_L2_PROMOTION_NONE
+#endif
+#ifndef MOE8_FC1_PROMO
+#define MOE8_FC1_PROMO CU_TENSOR_MAP_L2_PROMOTION_L2_256B
+#endif
+    me.a2 = fp4_map(w2.data_ptr(), E * kHidden, 128, 2, 32, MOE8_FC2_PROMO);
     me.w13 = w13.data_ptr();
     me.w2 = w2.data_ptr();
     me.E = E;
