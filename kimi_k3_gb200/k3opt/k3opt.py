@@ -164,6 +164,13 @@ def _load_ext():
     build()
 
 
+def _kda_op():
+    # K3OPT_KDASPLIT=1: value-dim split cluster kernel (agents/kda), bit-identical results.
+    if _flag("K3OPT_KDASPLIT"):
+        return torch.ops.k3kdas.fused_kda_decode
+    return torch.ops.k3kda.fused_kda_decode
+
+
 def _patch_kda6():
     import vllm._custom_ops as vops
     from vllm.models.kimi_k3.nvidia import kda as k3_kda
@@ -183,7 +190,7 @@ def _patch_kda6():
         if out is None:
             out = torch.empty(1, x.shape[0], raw_g.shape[2], raw_g.shape[3],
                               dtype=x.dtype, device=x.device)
-        torch.ops.k3kda.fused_kda_decode(x, weight, bias, conv_state, raw_g, raw_beta, A_log,
+        _kda_op()(x, weight, bias, conv_state, raw_g, raw_beta, A_log,
                                          dt_bias, state_indices, state, out, lower_bound,
                                          output_gate, norm_weight, norm_eps)
         return out
@@ -489,3 +496,9 @@ def register():
     if _flag("K3OPT_MLA"):
         from mla_patch import patch_mla
         patch_mla(_load_ext)
+    if _flag("K3OPT_L2PF"):
+        from l2pf_patch import patch_l2pf
+        patch_l2pf(_load_ext)
+    if _flag("K3OPT_GEMV"):
+        from gemv_patch import patch_gemv
+        patch_gemv(_load_ext)

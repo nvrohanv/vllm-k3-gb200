@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **143.1 (6.989 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **250.3 (7.989 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **410.4 (9.746 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **702.4 (11.390 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **149.2 (6.701 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **256.9 (7.787 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **425.8 (9.395 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **725.9 (11.020 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -33,6 +33,9 @@ source files are edited; the patches are installed at plugin registration.
     MXFP4 shuffled layout in place and returns the *unfinalized* per-(token, expert) rows the K3
     MoE-tail collective expects. Top-k is computed next to the gate GEMM, while the down-projection
     runs on the aux stream. This replaces MXFP8 quantize + routing + FC1 + FC2 (~27 µs → ~13 µs at M=1).
+  - `K3OPT_KDASPLIT=1` (`csrc/kda_split.cu`): KDA decode with the value dimension split over a
+    thread-block cluster (8 CTAs per head at M=1), with state prefetched before `griddepcontrol.wait`
+    and bit-identical results. ~8.4 → ~2 µs at M=1, ~8.6 → ~3.1 µs at M=8, on 69 layers.
   - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`, being validated): two fused cluster kernels for
     the MLA decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate).
   - Experimental and not a win: `K3OPT_ROUTE`, `K3OPT_ARRES` (`csrc/ar_attn_res.cu`).
@@ -54,3 +57,4 @@ source files are edited; the patches are installed at plugin registration.
 | + KDA6 + DOWNSHARD | 7.613 | 11.629 |
 | + TAILATTN | 7.394 | 11.441 |
 | + MOEFUSED (M ≤ 2) | 6.989 | 11.390 |
+| + KDASPLIT | 6.701 | 11.020 |
