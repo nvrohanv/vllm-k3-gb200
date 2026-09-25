@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **159.2 (6.283 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **276.2 (7.240 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **448.9 (8.910 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **753.6 (10.615 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **173.4 (5.769 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **299.3 (6.682 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **481.2 (8.313 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **787.8 (10.155 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -39,7 +39,7 @@ source files are edited; the patches are installed at plugin registration.
   - `K3OPT_KDAFB=1` (`kda_fb_patch.py`): the KDA gate low-rank up-projection (`f_b_proj`, a separate
     cuBLAS call) is computed inside the KDA split kernel by a dedicated warp, matching cuBLAS's
     accumulation order bit for bit.
-  - `K3OPT_OPROJ=1` (`csrc/oproj_ar.cu`, `oproj_patch.py`, being validated): the o_proj GEMV epilogue
+  - `K3OPT_OPROJ=1` (`csrc/oproj_ar.cu`, `oproj_patch.py`): the o_proj GEMV epilogue
     multicasts each rank's partial into a Lamport mailbox on all 16 GPUs, and the consumer sums the 16
     slots in a fixed order and runs the post-attention AttnRes. o_proj + all-reduce + AttnRes become
     one PDL kernel.
@@ -75,3 +75,4 @@ source files are edited; the patches are installed at plugin registration.
 | + KDASPLIT | 6.701 | 11.020 |
 | + MLA + L2PF (`combo5g`) | 6.404 | 10.822 |
 | + KDAFB | 6.283 | 10.615 |
+| + OPROJ (fused o_proj + NVLS all-reduce + AttnRes) | 5.769 | 10.155 |
