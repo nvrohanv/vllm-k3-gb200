@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **181.5 (5.511 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **329.3 (6.074 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **544.5 (7.346 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **882.2 (9.068 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **183.3 (5.454 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **332.8 (6.009 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **551.2 (7.257 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **891.8 (8.970 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -65,6 +65,11 @@ source files are edited; the patches are installed at plugin registration.
     replaces the CUDA-core FC1/FC2 inside the M ≤ 4 MoE block. The block kernel then runs in
     routing-only mode: top-k, shared expert, latent hand-off. At M=1 the extra kernel boundary
     costs more than the FC gain, so M=1 keeps the fused CUDA-core block.
+  - `K3OPT_STEP=1` (`csrc/k3samp.cu`, `step_patch.py`): distributed sampling. For plain
+    temperature-0/1 batches (no top-p/k, penalties or logprobs), each rank runs vLLM's own
+    Gumbel-max over its vocab shard, and one NVLS mailbox exchange of (value, id) picks the token.
+    Sampled ids are bit-identical to vLLM's on all 16 ranks. Otherwise, a one-hop NVLS all-gather
+    replaces NCCL's ring for the logits. This removes ~60–100 µs of per-step eager work.
   - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`): two fused cluster kernels replace 8 in the MLA
     decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate). The dispatch is
     decided inside an eager-break function, so it is correct under breakable piecewise graphs.
@@ -105,6 +110,7 @@ source files are edited; the patches are installed at plugin registration.
 | + MOEBLOCK (M ≤ 2) | 5.383 | 10.159 |
 | + PLANS (split-K GEMM, M = 3..16) | 5.50* | 9.873 |
 | + MOEBLOCK up to M = 4, tensor-core MoE (moe8) for M = 5..8 | 5.53 | 9.072 (B=4 7.772) |
-| + moe8 FC1/FC2 inside the MoE block for M = 2..4 (`moe8c`) | 5.511 | **9.068** (B=4 **7.346**) |
+| + moe8 FC1/FC2 inside the MoE block for M = 2..4 (`moe8c`) | 5.511 | 9.068 (B=4 7.346) |
+| + distributed sampling / NVLS logits gather (`stepB`) | **5.454** | **8.970** (B=4 **7.257**) |
 
 \* B=1 doesn't use the PLANS path; 5.38 vs 5.50 is restart-to-restart noise.

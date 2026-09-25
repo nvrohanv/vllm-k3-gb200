@@ -199,6 +199,10 @@ def dist_argmax(local_max, local_arg, idx_mapping, seq_lens, cu_num_logits, pref
     num_rejected = torch.empty(M, dtype=torch.int32, device=dev)
     buf = _STATE["arg_call"] % NBUF
     _STATE["arg_call"] += 1
+    # The V2 runner's metadata may be int64 or strided views; the kernel wants dense int32 [M].
+    idx_mapping, seq_lens, cu_num_logits, prefill_len = (
+        t if (t.dtype == torch.int32 and t.is_contiguous()) else t.to(torch.int32).contiguous()
+        for t in (idx_mapping, seq_lens, cu_num_logits, prefill_len))
     torch.ops.k3samp.dist_argmax(local_max, local_arg, _STATE["arg_mb"], _STATE["arg_mc"], buf,
                                  _STATE["rank"], _STATE["mode"], idx_mapping, seq_lens,
                                  cu_num_logits, prefill_len, sampled, num_sampled, num_rejected)
