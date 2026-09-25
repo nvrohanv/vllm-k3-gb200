@@ -3,7 +3,9 @@
 Call ``patch_plans()`` once per process at plugin-registration time, before model construction
 (``enable_kimi_k3_low_latency_gemm`` builds the per-module plans at model init). A/B switch:
 ``K3PLANS_DISABLE=1`` (nothing is patched). ``K3PLANS_ONLY="3216x7168,2112x7168"`` restricts the extra
-entries to those (N x K) weights; ``K3PLANS_MAX_M`` (default 16) caps the token count.
+entries to those (N x K) weights; ``K3PLANS_MIN_M`` (default 3) / ``K3PLANS_MAX_M`` (default 16) bound the
+token counts. ``K3PLANS_MIN_M=1`` additionally enables the M = 1..2 cells (FlashInfer direct GEMM for the
+KDA in_proj and the MLA gate; ~0.2 us/call in the chain, i.e. marginal -- A/B before adopting).
 
 What it changes (vllm/models/kimi_k3/nvidia/low_latency_gemm.py):
   * ``_build_plan(spec)``: after the original plan is built, the measured winners in ``EXTRA[(N, K)]``
@@ -18,8 +20,9 @@ What it changes (vllm/models/kimi_k3/nvidia/low_latency_gemm.py):
     tcgen05 MMA, K split across a 2/4-CTA cluster and reduced in-kernel through DSMEM, one bf16
     store; no separate split-K reduce kernel) with PDL. Its weight TMA warp starts streaming weights
     before ``griddepcontrol.wait`` (only the activation loads wait), so an early-triggering predecessor
-    (k3tail.lamport_attn_res) hides the first ~200 KB/CTA of weight traffic. All other backends go
-    to the original ``_run_plan``.
+    (k3tail.lamport_attn_res) hides the first ~200 KB/CTA of weight traffic. ``"fi_direct"`` entries
+    (opt-in M = 1..2 only) run FlashInfer's CuTeDSL direct CUDA-core GEMM (``run_direct_dense``) with
+    PDL. All other backends go to the original ``_run_plan``.
   * Runtime guard: x and weight must be 2-D, contiguous, bf16, on the same CUDA device, with matching
     K; otherwise ``None`` is returned and the caller falls back to cuBLAS exactly as before.
 CUDA graphs: the dispatch depends only on (N, K, M) (static per captured graph). FlashInfer compiles a
@@ -38,12 +41,19 @@ _S1 = (64, 8, 2, 12)   # mma_m (public N tile), mma_n (public M tile), split_k (
 _S2 = (64, 16, 2, 11)
 _S4 = (64, 8, 4, 12)
 _S4W = (64, 16, 4, 10)
+# FlashInfer CuTeDSL direct (CUDA-core) GEMM tactics (block_size, outputs_per_block, rows_per_block),
+# used only for the opt-in M = 1..2 cells (K3PLANS_MIN_M=1).
+_D11 = (128, 1, 1)
+_D21 = (128, 2, 1)
+_D22 = (128, 2, 2)
 
 # (N, K) -> {M: (backend, config)}; only cells measured to win in the model-like chain (RESULTS.md).
 # Installed into vLLM's plan table (KimiK3LowLatencyLinearMethod + try_low_latency_gemm).
 EXTRA: dict[tuple[int, int], dict[int, tuple[str, tuple]]] = {
     # KDA in_proj_qkvgfab (69 layers): cuBLAS splitK + splitKreduce today for M >= 3
-    (3216, K): {**{m: ("fi_splitk", _S1) for m in range(3, 9)},
+    # M = 1..2 (opt-in, K3PLANS_MIN_M=1): measured -0.17 / -0.19 us vs vLLM's CuTe skinny (noise ~0.1)
+    (3216, K): {1: ("fi_direct", _D11), 2: ("fi_direct", _D22),
+                **{m: ("fi_splitk", _S1) for m in range(3, 9)},
                 **{m: ("fi_splitk", _S2) for m in range(9, 17)}},
     # MLA qkv_a slice of fused_qkv_a_g_proj (24 layers): cuBLAS, or dsv3 at M = 4 / 16, today
     (2112, K): {**{m: ("fi_splitk", _S4) for m in range(3, 9)},
@@ -53,12 +63,14 @@ EXTRA: dict[tuple[int, int], dict[int, tuple[str, tuple]]] = {
 # which runs on the aux stream next to qkv_a). 768x7168 is also the shared-expert gate_up shape, which
 # runs next to the routed experts, off the critical path, and measured no gain -> left on vLLM's plan.
 EXTRA_MLA: dict[tuple[int, int], dict[int, tuple[str, tuple]]] = {
-    (768, K): {m: ("fi_splitk", _S4) for m in range(3, 17)},
+    # M = 1..2 (opt-in, K3PLANS_MIN_M=1): measured -0.20 / -0.23 us vs vLLM's CuTe skinny gate
+    (768, K): {1: ("fi_direct", _D21), 2: ("fi_direct", _D22),
+               **{m: ("fi_splitk", _S4) for m in range(3, 17)}},
 }
 
 _STATE = {"patched": False, "orig_build_plan": None, "orig_run_plan": None, "orig_mla_gemm": None,
           "tactics": {},
-          "stats": {"fi_splitk": 0, "fallback": 0}}
+          "stats": {"fi_splitk": 0, "fi_direct": 0, "fallback": 0}}
 
 
 def _enabled() -> bool:
@@ -67,6 +79,7 @@ def _enabled() -> bool:
 
 def _extra_table(src=None) -> dict:
     max_m = int(os.environ.get("K3PLANS_MAX_M", "16"))
+    min_m = int(os.environ.get("K3PLANS_MIN_M", "3"))  # M = 1..2 stay on vLLM's CuTe plan by default
     only = os.environ.get("K3PLANS_ONLY", "")
     keep = None
     if only:
@@ -75,7 +88,7 @@ def _extra_table(src=None) -> dict:
     for nk, cells in (EXTRA if src is None else src).items():
         if keep is not None and nk not in keep:
             continue
-        out[nk] = {m: e for m, e in cells.items() if m <= max_m}
+        out[nk] = {m: e for m, e in cells.items() if min_m <= m <= max_m}
     return out
 
 
@@ -89,11 +102,15 @@ def _tactic(cfg):
     return t
 
 
+def _eligible(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (x.dim() == 2 and weight.dim() == 2 and x.is_contiguous() and weight.is_contiguous()
+            and x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and x.is_cuda
+            and x.device == weight.device and x.shape[1] == weight.shape[1] and 1 <= x.shape[0] <= 32)
+
+
 def run_fi_splitk(x: torch.Tensor, weight: torch.Tensor, cfg) -> torch.Tensor | None:
     """y = x @ weight.T with FlashInfer's CuTeDSL low-M split-K GEMM (PDL), or None if not eligible."""
-    if not (x.dim() == 2 and weight.dim() == 2 and x.is_contiguous() and weight.is_contiguous()
-            and x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and x.is_cuda
-            and x.device == weight.device and x.shape[1] == weight.shape[1] and 1 <= x.shape[0] <= 32):
+    if not _eligible(x, weight):
         _STATE["stats"]["fallback"] += 1
         return None
     from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import run_splitk_dense
@@ -102,6 +119,26 @@ def run_fi_splitk(x: torch.Tensor, weight: torch.Tensor, cfg) -> torch.Tensor | 
     run_splitk_dense(x, weight.t(), None, out, True, _tactic(cfg))
     _STATE["stats"]["fi_splitk"] += 1
     return out
+
+
+def run_fi_direct(x: torch.Tensor, weight: torch.Tensor, cfg) -> torch.Tensor | None:
+    """y = x @ weight.T with FlashInfer's CuTeDSL direct (CUDA-core) GEMM (PDL), or None."""
+    if not (_eligible(x, weight) and x.shape[0] % cfg[2] == 0 and weight.shape[0] % cfg[1] == 0):
+        _STATE["stats"]["fallback"] += 1
+        return None
+    from flashinfer.gemm.kernels.dense_bf16_gemm_direct import DirectTactic, run_direct_dense
+
+    t = _STATE["tactics"].get(("direct",) + tuple(cfg))
+    if t is None:
+        t = DirectTactic(*cfg)
+        _STATE["tactics"][("direct",) + tuple(cfg)] = t
+    out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+    run_direct_dense(x, weight.t(), out, True, t)
+    _STATE["stats"]["fi_direct"] += 1
+    return out
+
+
+_RUNNERS = {"fi_splitk": run_fi_splitk, "fi_direct": run_fi_direct}
 
 
 def patch_plans() -> None:
@@ -136,8 +173,8 @@ def patch_plans() -> None:
 
     def _run_plan(plan, x, weight):
         entry = plan.get(x.shape[0])
-        if entry is not None and entry[0] == "fi_splitk":
-            return run_fi_splitk(x, weight, entry[1])
+        if entry is not None and entry[0] in _RUNNERS:
+            return _RUNNERS[entry[0]](x, weight, entry[1])
         return orig_run(plan, x, weight)
 
     llg._build_plan = _build_plan
@@ -153,8 +190,8 @@ def patch_plans() -> None:
         def _unquantized_gemm(self, hidden_states, weight):
             cells = mla_table.get((weight.shape[0], weight.shape[1])) if weight.dim() == 2 else None
             entry = cells.get(hidden_states.shape[0]) if cells else None
-            if entry is not None and entry[0] == "fi_splitk":
-                out = run_fi_splitk(hidden_states, weight, entry[1])
+            if entry is not None and entry[0] in _RUNNERS:
+                out = _RUNNERS[entry[0]](hidden_states, weight, entry[1])
                 if out is not None:
                     return out
             return orig_gemm(self, hidden_states, weight)

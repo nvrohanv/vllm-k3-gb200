@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **185.8 (5.383 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **330.4 (6.052 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **500.0 (7.999 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **810.3 (9.873 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **181.7 (5.505 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **331.7 (6.030 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **514.7 (7.772 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **881.8 (9.072 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -53,6 +53,15 @@ source files are edited; the patches are installed at plugin registration.
     (`run_splitk_dense`: cluster split-K, reduction in-kernel, PDL weight prefetch) to vLLM's
     low-latency GEMM plan table for KDA in_proj and MLA qkv_a/gate at M = 3..16, replacing
     cuBLAS split-K + reduce.
+  - `K3OPT_MOE8=1` (`csrc/moe8.cu`, `tc_utils.cuh`, `mma_issue.cuh`): a tensor-core MXFP4 MoE in one
+    persistent launch:
+    - MXFP8 quantization of x, then FC1, SiTU and MXFP8 quantization of h, then FC2 with bf16
+      unfinalized output;
+    - tcgen05 block-scaled MMA (swap-AB M=128 N=8), TMA and TMEM;
+    - reads TRT-LLM's shuffled layout in place.
+    Standalone it takes 12.2 / 14.5 / 19.4 / 30.2 µs at M = 1 / 2 / 4 / 8, against TRT-LLM's quant +
+    routing + FC1 + FC2 at 17.9 / 21.3 / 31.1 / 55.0 µs. Used for M = 5..8 through the fused-MoE path;
+    top-k runs in the router branch.
   - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`): two fused cluster kernels replace 8 in the MLA
     decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate). The dispatch is
     decided inside an eager-break function, so it is correct under breakable piecewise graphs.
@@ -88,5 +97,6 @@ source files are edited; the patches are installed at plugin registration.
 | + OPROJ (fused o_proj + NVLS all-reduce + AttnRes) | 5.769 | 10.155 |
 | + MOEBLOCK (M ≤ 2) | 5.383 | 10.159 |
 | + PLANS (split-K GEMM, M = 3..16) | 5.50* | 9.873 |
+| + MOEBLOCK up to M = 4, tensor-core MoE (moe8) for M = 5..8 | 5.53 | **9.072** (B=4 7.772) |
 
 \* B=1 doesn't use the PLANS path; 5.38 vs 5.50 is restart-to-restart noise.

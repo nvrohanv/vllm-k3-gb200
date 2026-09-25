@@ -36,7 +36,10 @@ import os
 import torch
 
 _STATE = {"patched": False, "orig_forward": None, "barriers": {}, "stats": {"fused": 0, "fallback": 0}}
-_MAX_M = 2
+# Largest M routed through the block path (kernels support 1..4); K3MOEBLOCK_MAX_M overrides
+# for A/B in the server. Default = best measured (see RESULTS.md).
+_DEFAULT_MAX_M = 3
+_MAX_M = max(0, min(4, int(os.environ.get("K3MOEBLOCK_MAX_M", str(_DEFAULT_MAX_M)))))
 _TOPK = 16
 _E = 896
 _H = 7168
@@ -50,6 +53,22 @@ def _enabled() -> bool:
 
 def _grid() -> int:
     return int(os.environ.get("K3MOEBLOCK_GRID", "0"))
+
+
+def _moe8_enabled() -> bool:
+    return os.environ.get("K3MOEBLOCK_MOE8", "0") == "1" and hasattr(torch.ops, "k3moe8") \
+        and hasattr(torch.ops.k3moe8, "moe_fused_unfinalized")
+
+
+def _moe8_workspace(dev) -> torch.Tensor:
+    # One 0xFF-armed workspace for every k3moe8 call in the process (k3opt's M 5..8 path too):
+    # the kernel keeps its own call parity in it, so all calls must share it in stream order.
+    import k3opt
+    ws = k3opt._fused_state.get("moe8_ws")
+    if ws is None:
+        ws = torch.full((torch.ops.k3moe8.workspace_bytes(),), 0xFF, dtype=torch.uint8, device=dev)
+        k3opt._fused_state["moe8_ws"] = ws
+    return ws
 
 
 def _barrier(dev) -> torch.Tensor:
@@ -182,7 +201,7 @@ def _forward_small(moe, s, hidden_states):
         mailbox = s["down_op"](x, s["down_w"], s["zero_shard"])
     # 2) router GEMV (scores) + shared gate_up/SiTU (main stream, overlaps the producer).
     scores = torch.empty(8, m, _E, 2, dtype=torch.float32, device=dev)  # 8 replicas
-    h_sh = torch.empty(m, _SH, dtype=torch.bfloat16, device=dev)
+    h_sh = torch.empty(m, 2 * _SH, dtype=torch.bfloat16, device=dev)  # shared gate_up (bf16)
     none_i = torch.empty(0, dtype=torch.int32, device=dev)
     none_w = torch.empty(0, dtype=torch.bfloat16, device=dev)
     K.route_shared(x, s["gate_w"], s["bias"], s["sh_w13"], scores, none_i, none_w, h_sh, s["sh_beta"],
@@ -195,9 +214,19 @@ def _forward_small(moe, s, hidden_states):
     gemm2 = torch.empty(m * _TOPK, _LAT, dtype=torch.bfloat16, device=dev)
     shared_out = torch.empty(m, _H, dtype=torch.bfloat16, device=dev)
     workspace = torch.empty(m * _TOPK * 192, dtype=torch.float16, device=dev)
-    K.moe_block_lamport(mailbox, scores, *s["w"], workspace, _barrier(dev), gemm2, ids, wts, h_sh,
-                        s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"], s["scale"],
-                        _grid())
+    if _moe8_enabled():
+        # Routing-only block kernel (top-k, shared expert, latent hand-off + mailbox re-arm),
+        # then the tcgen05 MXFP4 MoE (agents/moe8) for FC1/FC2.
+        latent = torch.empty(m, _LAT, dtype=torch.bfloat16, device=dev)
+        K.moe_block_lamport(mailbox, scores, *s["w"], workspace, _barrier(dev), gemm2, ids, wts, h_sh,
+                            s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"],
+                            s["scale"], _grid(), s["sh_beta"], s["sh_lbeta"], None, latent)
+        torch.ops.k3moe8.moe_fused_unfinalized(latent, ids, *s["w"], _moe8_workspace(dev),
+                                               _barrier(dev), gemm2, s["betas"][0], s["betas"][1])
+    else:
+        K.moe_block_lamport(mailbox, scores, *s["w"], workspace, _barrier(dev), gemm2, ids, wts, h_sh,
+                            s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"],
+                            s["scale"], _grid(), s["sh_beta"], s["sh_lbeta"])
     ident = s["ident"].get(m)
     if ident is None:
         ident = torch.arange(m * _TOPK, dtype=torch.int32, device=dev).view(m, _TOPK)
@@ -255,6 +284,7 @@ def patch_moeblock(load_ext) -> None:
     KimiMoE.forward = forward
     _STATE["patched"] = True
     print(f"[k3opt] K3MOEBLOCK: fused router/top-k + MoE + shared expert for M<={_MAX_M} "
+          f"{'[FC1/FC2 via k3moe8 tcgen05] ' if os.environ.get('K3MOEBLOCK_MOE8', '0') == '1' else ''}"
           f"(grid={_grid() or 'all SMs'})", flush=True)
 
 

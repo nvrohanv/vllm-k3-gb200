@@ -388,16 +388,21 @@ struct BlockArgs {
   const uint2* scores;            // [M][896] (sigmoid(logit), sigmoid(logit) + bias) from route_shared
   int* ids_out;                   // [M][16] routing written by CTA 0 (for the MoE tail)
   __nv_bfloat16* wts_out;         // [M][16]
-  const __nv_bfloat16* h_sh;      // [M][384] shared-expert activations (route_shared)
+  const __nv_bfloat16* h_sh;      // [M][768] shared-expert gate_up output (route_shared), SiTU applied here
   const __nv_bfloat16* w_sd;      // [7168][384] shared down_proj shard
   __nv_bfloat16* sh_out;          // [M][7168] shared-expert partial output
   float rscale;                   // routed_scaling_factor
   int renorm;
+  float sh_beta, sh_lbeta;        // shared-expert SiTU betas (lbeta <= 0: none)
+  __nv_bfloat16* latent_out;      // non-null: routing-only mode (no FC1/FC2): CTA 0 copies the latent
+                                  // [M][3584] out of the mailbox (and re-arms it) for another MoE kernel
 };
+constexpr int kBlockMaxM = 4;
+constexpr int kTopkWarp0 = 16 - kBlockMaxM;  // warps 12..15 route tokens 0..3
 constexpr int kSdRows = kHidden * 2;  // 7168 shared down rows (hidden)
 constexpr int kSdK = 384;             // shared intermediate per rank
 constexpr int kSdRowBytes = kSdK * 2; // 768
-constexpr int kTopkScratch = 1056 + 3 * 64 + 1;  // hist (bank-skewed 1024) + candidates (+dump) + counter
+constexpr int kTopkScratch = 3 * 64 + 1;  // candidates (32 + per-lane dump) x (id, key, score) + counter
 
 // Exact top-16 of 896 (score + bias) for one token, one warp. Values -> 1024 bins over [min,max];
 // the bins from the one holding the 16th largest upward are the candidates (ranked exactly,
@@ -446,7 +451,7 @@ __device__ __forceinline__ void warp_top16(const uint2* __restrict__ row, unsign
   }
   const unsigned ncand = __shfl_sync(0xffffffffu, excl, 31);
   TK_MARK(2)
-  int* ci = reinterpret_cast<int*>(hist + 1056);
+  int* ci = reinterpret_cast<int*>(hist);
   uint32_t* ck = reinterpret_cast<uint32_t*>(ci + 64);
   float* cs = reinterpret_cast<float*>(ck + 64);
   if (tr && lane == 0) tr[5] = ncand;
@@ -553,7 +558,14 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
   }
   extern __shared__ __align__(128) uint8_t smem[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const FusedWork W = fused_work(M);
+  FusedWork W = fused_work(M);
+  const bool routed_only = kBlock && ba.latent_out != nullptr;
+  if (routed_only) {  // routing + shared expert only: no routed FC1/FC2 work in this kernel
+    W.qa = W.qb = 0;
+    W.ngroups = 0;
+    W.nunits = 0;
+    W.nf2 = 0;
+  }
   // Shared memory map: x (bf16, later fp16 h) | red | acc2 | wsm | barriers | ring.
   const int x_bytes = M * kHidden * 2;
   uint8_t* xs = smem;
@@ -564,10 +576,10 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
   float* wsm = acc2 + max_rows2;
   // Block variant: routing ids, top-k scratch (2 warps), shared-expert activations (fp32).
   int* tks = reinterpret_cast<int*>(wsm + M * kTopK);
-  unsigned* tkscr = reinterpret_cast<unsigned*>(tks + (kBlock ? 2 * kTopK : 0));
-  float* sel_sm = reinterpret_cast<float*>(tkscr + (kBlock ? 2 * kTopkScratch : 0));
+  unsigned* tkscr = reinterpret_cast<unsigned*>(tks + (kBlock ? kBlockMaxM * kTopK : 0));
+  float* sel_sm = reinterpret_cast<float*>(tkscr + (kBlock ? kBlockMaxM * kTopkScratch : 0));
   float* hsh = reinterpret_cast<float*>(
-      (reinterpret_cast<uintptr_t>(sel_sm + (kBlock ? 2 * kTopK : 0)) + 15) & ~static_cast<uintptr_t>(15));
+      (reinterpret_cast<uintptr_t>(sel_sm + (kBlock ? kBlockMaxM * kTopK : 0)) + 15) & ~static_cast<uintptr_t>(15));
   uint64_t* bars = reinterpret_cast<uint64_t*>(
       (reinterpret_cast<uintptr_t>(hsh + (kBlock ? M * kSdK : 0)) + 15) & ~static_cast<uintptr_t>(15));
   uint8_t* stages = reinterpret_cast<uint8_t*>(
@@ -589,7 +601,7 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
       mbar_init(full_bar(s), 1);
       mbar_init(empty_bar(s), kConsumerWarps);
     }
-    if (kBlock) mbar_init(route_bar, 2);
+    if (kBlock) mbar_init(route_bar, kBlockMaxM);
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
   }
@@ -677,7 +689,7 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
     int k0 = 0;
     if (kBlock) {
       k0 = min(nsd, nstages);   // shared down_proj stages were issued before the wait
-      mbar_wait(route_bar, 0);  // routing computed in-kernel (consumer warps 14, 15)
+      mbar_wait(route_bar, 0);  // routing computed in-kernel (consumer warps 12..15)
     }
     if (lane == 0) K3_MARK(27)
     for (int k = k0; k < first; ++k) issue(k);
@@ -706,7 +718,22 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
       asm volatile("ld.relaxed.gpu.global.u64 %0, [%1];" : "=l"(c0) : "l"(counter) : "memory");
       bar_target = (c0 / gridDim.x + 1) * gridDim.x;
     }
-    if constexpr (kLamport) {
+    if (routed_only) {
+      // CTA 0 hands the latent to the next kernel: poll, copy out, re-arm (like LamportCopy).
+      if (blockIdx.x == 0) {
+        for (int f = tid; f < M * (kHidden / 8); f += kConsumerThreads) {
+          const uint4* src = reinterpret_cast<const uint4*>(x) + f;
+          uint4 v;
+          do {
+            asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                         : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src) : "memory");
+          } while (v.x == 0x80000000u || v.y == 0x80000000u || v.z == 0x80000000u || v.w == 0x80000000u);
+          reinterpret_cast<uint4*>(ba.latent_out)[f] = v;
+          asm volatile("st.global.v4.u32 [%0], {%1, %1, %1, %1};" ::"l"(src), "r"(0x80000000u) : "memory");
+        }
+      }
+      mbar_arrive(xbar);
+    } else if constexpr (kLamport) {
       // Poll this CTA's x rows (<= 2 tokens) out of the mailbox, 16 B per thread per token.
       const int t_lo = W.qa / kPairsPerTok, t_hi = (W.qb - 1) / kPairsPerTok;
       constexpr int kFrags = kHidden / 8;  // 448
@@ -724,14 +751,14 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
       if (tid == 0) K3_MARK(24)
     }
     if constexpr (kBlock) {
-      if (warp >= kFc1Warps) {
-        // Routing: warp 14 -> token 0, warp 15 -> token 1 (M <= 2).
-        const int t = warp - kFc1Warps;
-        if (t < M) {
+      if (warp >= kTopkWarp0) {
+        // Routing: warp 12 + t -> token t (M <= 4), one warp per token in parallel.
+        const int t = warp - kTopkWarp0;
+        if (t < M && (!routed_only || blockIdx.x == 0)) {
           int* sel_i = tks + t * kTopK;
           float* sel_s = sel_sm + t * kTopK;
           warp_top16(ba.scores + ((blockIdx.x % 8) * M + t) * 896, tkscr + t * kTopkScratch, sel_i, sel_s, lane,
-                     (trace && t == 0) ? trace + blockIdx.x * 32 + 26 : nullptr);
+                     nullptr);
           float sv = lane < kTopK ? sel_s[lane] : 0.f;
           float sum = sv;
 #pragma unroll
@@ -744,46 +771,53 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
         __syncwarp();
         if (lane == 0) mbar_arrive(route_bar);
       } else {
-        for (int i = tid; i < M * kSdK; i += kFc1Warps * 32) hsh[i] = __bfloat162float(ba.h_sh[i]);
-        asm volatile("bar.sync 2, %0;" ::"n"(kFc1Warps * 32) : "memory");
+        // Shared expert: h = bf16(SiTU(gate, up)) from route_shared's bf16 gate_up output
+        // (same rounding points as vLLM's GEMM + situ_and_mul), kept as fp32 for the down GEMV.
+        for (int i = tid; i < M * kSdK; i += kTopkWarp0 * 32) {
+          const int t = i / kSdK, c = i - t * kSdK;
+          const float gv = __bfloat162float(ba.h_sh[t * 2 * kSdK + c]);
+          const float uv = __bfloat162float(ba.h_sh[t * 2 * kSdK + kSdK + c]);
+          const float ga = ba.sh_beta * tanhf(gv / ba.sh_beta) * (1.f / (1.f + expf(-gv)));
+          const float ua = ba.sh_lbeta > 0.f ? ba.sh_lbeta * tanhf(uv / ba.sh_lbeta) : uv;
+          hsh[i] = __bfloat162float(__float2bfloat16(ga * ua));
+        }
+        asm volatile("bar.sync 2, %0;" ::"n"(kTopkWarp0 * 32) : "memory");
       }
       if (tid == 0) K3_MARK(3)
       // Shared-expert down_proj partial: out[t][n] = W_sd[n, :384] . h[t, :]. Row per warp
-      // (warps 0..13), 3 x 8 B per lane per token; warps 14, 15 only keep the ring in step.
+      // (warps 0..11, while the routing warps finish), 3 x 8 B per lane per token; warps 12..15
+      // only keep the ring in step. Runs under the FC1 weight latency.
       for (int k = 0; k < nsd; ++k) {
         const int s = k % nstages;
         mbar_wait(full_bar(s), (k / nstages) & 1);
-        if (tid == 0 && k == 0) K3_MARK(28)
         const int r0 = sd_a + k * sd_per, r1 = min(sd_b, r0 + sd_per);
         const uint8_t* sw = stages + s * kStageBytes;
-        if (warp < kFc1Warps) {
-          const bool two = M > 1;
-          for (int r = warp; r < r1 - r0; r += kFc1Warps) {
-            float a0 = 0.f, a1 = 0.f;
+        if (warp < kTopkWarp0) {
+          for (int r = warp; r < r1 - r0; r += kTopkWarp0) {
+            float a[kBlockMaxM] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
             for (int q = 0; q < 3; ++q) {
               const int e0 = 4 * (lane + 32 * q);
               const uint2 wv = *reinterpret_cast<const uint2*>(sw + r * kSdRowBytes + e0 * 2);
               const float2 w01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.x));
               const float2 w23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&wv.y));
-              const float4 h0 = *reinterpret_cast<const float4*>(hsh + e0);
-              a0 = fmaf(w01.x, h0.x, fmaf(w01.y, h0.y, fmaf(w23.x, h0.z, fmaf(w23.y, h0.w, a0))));
-              if (two) {
-                const float4 h1 = *reinterpret_cast<const float4*>(hsh + kSdK + e0);
-                a1 = fmaf(w01.x, h1.x, fmaf(w01.y, h1.y, fmaf(w23.x, h1.z, fmaf(w23.y, h1.w, a1))));
+#pragma unroll
+              for (int tt = 0; tt < kBlockMaxM; ++tt)
+                if (tt < M) {
+                  const float4 hv = *reinterpret_cast<const float4*>(hsh + tt * kSdK + e0);
+                  a[tt] = fmaf(w01.x, hv.x, fmaf(w01.y, hv.y, fmaf(w23.x, hv.z, fmaf(w23.y, hv.w, a[tt]))));
+                }
+            }
+#pragma unroll
+            for (int tt = 0; tt < kBlockMaxM; ++tt)
+              if (tt < M) {
+                const float v = warp_sum(a[tt]);
+                if (lane == 0) ba.sh_out[static_cast<long>(tt) * kSdRows + r0 + r] = __float2bfloat16(v);
               }
-            }
-            a0 = warp_sum(a0);
-            if (two) a1 = warp_sum(a1);
-            if (lane == 0) {
-              ba.sh_out[r0 + r] = __float2bfloat16(a0);
-              if (two) ba.sh_out[kSdRows + r0 + r] = __float2bfloat16(a1);
-            }
           }
         }
         __syncwarp();
         if (lane == 0) mbar_arrive(empty_bar(s));
-        if (tid == 0 && k == 0) K3_MARK(29)
       }
       if (tid == 0) K3_MARK(25)
     }
@@ -812,13 +846,28 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
         cur_t = t;
         if (tid == 0) K3_MARK(2)
       }
+#ifdef K3_FC1TRACE
+      if (trace && tid == 0 && k < 16) {
+        unsigned long long ts;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
+        trace[(gridDim.x + blockIdx.x) * 32 + k] = ts;
+      }
+#endif
       mbar_wait(full_bar(s), (kseq / nstages) & 1);
+#ifdef K3_FC1TRACE
+      if (trace && tid == 0 && k < 16) {
+        unsigned long long ts;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(ts));
+        trace[(gridDim.x + blockIdx.x) * 32 + 16 + k] = ts;
+      }
+#endif
       if (k == 0 && tid == 0 && !kBlock) K3_MARK(3)
       const uint8_t* sw = stages + s * kStageBytes;
       const uint8_t* ssc = sw + kStageW + (c >> 2) * 256 + rg * 4 + (c & 3);
       const int sigma0 = 2 * (qs - W.qa);
       const int s0 = (rs - sigma0) & 3;
       float v[4];
+#ifdef FC1_SERIAL
 #pragma unroll
       for (int m = 0; m < 4; ++m) {
         const int sl = s0 + 4 * m;
@@ -826,13 +875,54 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
         if (sl < 2 * n) {
           const uint4 wv = *reinterpret_cast<const uint4*>(sw + sl * kW13RowBytes + c * 16);
           const int rib = sl < n ? r0 + sl : 8 + r0 + sl - n;
-#ifdef NO_MATH
-          v[m] = __int_as_float((wv.x ^ wv.w) & 0x3fffffff) + __half2float(xr[m].x) + ssc[rib * 16];
-#else
           v[m] = ue8m0(ssc[rib * 16]) * dot32_h(wv, xr);
+        }
+      }
+#else
+      {
+        // Four rows at once, branch-free (rows past the group read a valid row and are zeroed):
+        // unconditional loads + 8 independent HFMA2 chains instead of 4 serialized dots.
+        uint4 wv[4];
+        float sc4[4];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+          const int sl = s0 + 4 * m;
+          const int slc = min(sl, 2 * n - 1);
+          wv[m] = *reinterpret_cast<const uint4*>(sw + slc * kW13RowBytes + c * 16);
+          const int rib = slc < n ? r0 + slc : 8 + r0 + slc - n;
+          sc4[m] = sl < 2 * n ? ue8m0(ssc[rib * 16]) : 0.f;
+        }
+        __half2 a0[4], a1[4];
+#pragma unroll
+        for (int m = 0; m < 4; ++m) a0[m] = a1[m] = __float2half2_rn(0.f);
+#ifndef NO_MATH
+#pragma unroll
+        for (int kw = 0; kw < 4; ++kw) {
+          uint32_t r[4][4];
+#pragma unroll
+          for (int m = 0; m < 4; ++m) {
+            const uint32_t w = kw == 0 ? wv[m].x : kw == 1 ? wv[m].y : kw == 2 ? wv[m].z : wv[m].w;
+            cvt_e2m1_word(w, r[m]);
+          }
+#pragma unroll
+          for (int b = 0; b < 4; b += 2)
+#pragma unroll
+            for (int m = 0; m < 4; ++m) {
+              a0[m] = __hfma2(*reinterpret_cast<const __half2*>(&r[m][b]), xr[kw * 4 + b], a0[m]);
+              a1[m] = __hfma2(*reinterpret_cast<const __half2*>(&r[m][b + 1]), xr[kw * 4 + b + 1], a1[m]);
+            }
+        }
+#endif
+#pragma unroll
+        for (int m = 0; m < 4; ++m) {
+          const float2 f = __half22float2(__hadd2(a0[m], a1[m]));
+          v[m] = sc4[m] * (f.x + f.y);
+#ifdef NO_MATH
+          v[m] = sc4[m] * __int_as_float((wv[m].x ^ wv[m].w) & 0x3fffffffu) + __half2float(xr[m].x);
 #endif
         }
       }
+#endif
       // Transpose-reduce 4 row partials over the 8 lanes sharing rs.
       const bool b4 = i8 & 4, b2 = i8 & 2;
       float k0 = b4 ? v[2] : v[0], k1 = b4 ? v[3] : v[1];
@@ -863,7 +953,7 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
       h[t * kPairsPerTok + j * kInter + i] = __float2half_rn(situ(up, gate, beta, linear_beta));
     }
     consumer_sync();
-    if (tid == 0) {
+    if (tid == 0 && !routed_only) {
       K3_MARK(4)
       // Every call adds exactly G to the counter, so this call's target is the next
       // multiple of G above the value read at start (our own add is still pending).
@@ -875,7 +965,7 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
       K3_MARK(5)
     }
     consumer_sync();
-    if (kLamport && blockIdx.x == 0) {
+    if (kLamport && blockIdx.x == 0 && !routed_only) {
       // Every CTA polled its x rows before the barrier: re-arm mailbox rows [0, M).
       const uint4 empty = make_uint4(0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u);
       for (int f = tid; f < M * (kHidden / 8); f += kConsumerThreads)
@@ -886,8 +976,9 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
     asm volatile("griddepcontrol.launch_dependents;");
     // Stage h (all tokens) into shared memory (over x).
     __half* hs = reinterpret_cast<__half*>(xs);
-    for (int v = tid; v < M * kPairsPerTok / 8; v += kConsumerThreads)
-      reinterpret_cast<uint4*>(hs)[v] = __ldcg(reinterpret_cast<const uint4*>(h) + v);
+    if (!routed_only)
+      for (int v = tid; v < M * kPairsPerTok / 8; v += kConsumerThreads)
+        reinterpret_cast<uint4*>(hs)[v] = __ldcg(reinterpret_cast<const uint4*>(h) + v);
     consumer_sync();
     if (tid == 0) K3_MARK(6)
 
@@ -1104,7 +1195,8 @@ void launch_fused(const torch::Tensor& x, const torch::Tensor& topk_ids, const f
 
   const int max_slots = 2 * ((M * kPairsPerTok + G - 1) / G) + 16;
   const int max_rows2 = M * 8 * ((kOctets + G - 1) / G);
-  const int block_extra = kBlock ? (2 * kTopK + 2 * kTopkScratch + 2 * kTopK) * 4 + 16 + M * kSdK * 4 : 0;
+  const int block_extra =
+      kBlock ? (kBlockMaxM * kTopK + kBlockMaxM * kTopkScratch + kBlockMaxM * kTopK) * 4 + 16 + M * kSdK * 4 : 0;
   const int fixed = M * kHidden * 2 + (max_slots + max_rows2 + M * kTopK) * 4 + block_extra + 16 +
                     (2 + 2 * 8) * 8 + 128;
   const int nstages = std::min(8, (232448 - fixed) / kStageBytes);
@@ -1148,8 +1240,9 @@ void launch_fused(const torch::Tensor& x, const torch::Tensor& topk_ids, const f
 constexpr int kRtE = 896;             // routed experts
 constexpr int kRtH = 7168;            // hidden
 constexpr int kRtSh = 384;            // shared intermediate per rank (6144 / TP16)
-constexpr int kRtMaxM = 2;
-constexpr int kRtRows = 12;           // <= 6 router + 3 gate + 3 up rows per CTA (G >= 150)
+constexpr int kRtMaxM = 4;             // scores mode (select mode: <= 2)
+constexpr int kRtSelMaxM = 2;
+constexpr int kRtRows = 11;           // flat rows (896 router + 768 shared gate_up) / 152 CTAs
 constexpr int kRtRowStride = kRtH * 2 + 64;  // bank-conflict padding
 constexpr int kRtThreads = 512;
 constexpr int kRtWarps = kRtThreads / 32;
@@ -1175,22 +1268,26 @@ route_shared_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __
                     float scale, int select, unsigned long long* __restrict__ trace) {
   extern __shared__ __align__(128) uint8_t smem[];
   uint8_t* rows = smem;                                                     // [12][kRtRowStride]
-  __nv_bfloat16* xs = reinterpret_cast<__nv_bfloat16*>(smem + kRtRows * kRtRowStride);  // [M][7168]
-  float* part = reinterpret_cast<float*>(xs + kRtMaxM * kRtH);             // [16 warps][16][2]
-  float* rowv = part + kRtWarps * 16 * kRtMaxM;                            // [16][2] reduced
-  uint32_t* keys = reinterpret_cast<uint32_t*>(rowv + 16 * kRtMaxM);       // [2][896]
-  float* scs = reinterpret_cast<float*>(keys + kRtMaxM * kRtE);            // [2][896]
-  unsigned* hist = reinterpret_cast<unsigned*>(scs + kRtMaxM * kRtE);      // [2][256]
-  unsigned* misc = hist + kRtMaxM * 256;                                    // [2][4]
-  int* lst_i = reinterpret_cast<int*>(misc + kRtMaxM * 4);                  // [2][16]
+  // smem: rows [11][stride] | x [M][7168] | part [16 warps][16][M] | rowv [16][M] |
+  //       (select mode) keys [M][896] | scs [M][896] | hist [M][256] | misc [M][4] | lst [M][16] | bar
+  __nv_bfloat16* xs = reinterpret_cast<__nv_bfloat16*>(smem + kRtRows * kRtRowStride);
+  float* part = reinterpret_cast<float*>(xs + M * kRtH);
+  float* rowv = part + kRtWarps * 16 * M;
+  uint32_t* keys = reinterpret_cast<uint32_t*>(rowv + 16 * M);
+  const int selM = select ? M : 0;
+  float* scs = reinterpret_cast<float*>(keys + selM * kRtE);
+  unsigned* hist = reinterpret_cast<unsigned*>(scs + selM * kRtE);
+  unsigned* misc = hist + selM * 256;
+  int* lst_i = reinterpret_cast<int*>(misc + selM * 4);
   uint64_t* bar = reinterpret_cast<uint64_t*>(
-      (reinterpret_cast<uintptr_t>(lst_i + kRtMaxM * 16) + 15) & ~static_cast<uintptr_t>(15));
+      (reinterpret_cast<uintptr_t>(lst_i + selM * 16) + 15) & ~static_cast<uintptr_t>(15));
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int G = gridDim.x, s = blockIdx.x;
-  const int ra = kRtE * s / G, rb = kRtE * (s + 1) / G;
-  const int pa = sh_w13 ? kRtSh * s / G : 0, pb = sh_w13 ? kRtSh * (s + 1) / G : 0;
-  const int nr = rb - ra, np = pb - pa, nrows = nr + 2 * np;
+  // Flat rows: 0..895 router, 896..1663 shared gate_up (gate 0..383, up 384..767).
+  const int total_rows = sh_w13 ? kRtE + 2 * kRtSh : kRtE;
+  const int fa = total_rows * s / G, fb = total_rows * (s + 1) / G;
+  const int nrows = fb - fa;
 #define RT_CK(slot)                                                             \
   if (trace && tid == 0 && s == 0) trace[G * 8 + (slot)] = clock64();
 #define RT_MARK(slot)                                                           \
@@ -1208,14 +1305,14 @@ route_shared_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __
     // Static weights: prefetch before waiting on the predecessor.
     mbar_arrive_expect_tx(mb, nrows * kRtH * 2);
     for (int r = 0; r < nrows; ++r) {
-      const __nv_bfloat16* src = r < nr ? gate_w + static_cast<long>(ra + r) * kRtH
-                                 : r < nr + np ? sh_w13 + static_cast<long>(pa + r - nr) * kRtH
-                                               : sh_w13 + static_cast<long>(kRtSh + pa + r - nr - np) * kRtH;
+      const int gr = fa + r;
+      const __nv_bfloat16* src = gr < kRtE ? gate_w + static_cast<long>(gr) * kRtH
+                                           : sh_w13 + static_cast<long>(gr - kRtE) * kRtH;
       tma_1d(smem_u32(rows + r * kRtRowStride), src, kRtH * 2, mb);
     }
   }
   // Static per-row bias, loaded before the wait as well.
-  const float my_bias = tid < 16 * M && tid / M < nr ? __ldg(bias + ra + tid / M) : 0.f;
+  const float my_bias = tid < 16 * M && tid / M < nrows && fa + tid / M < kRtE ? __ldg(bias + fa + tid / M) : 0.f;
   __syncthreads();
   asm volatile("griddepcontrol.wait;" ::: "memory");
   asm volatile("griddepcontrol.launch_dependents;");
@@ -1260,12 +1357,12 @@ route_shared_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __
       c[q] = ((acc[0][q] + acc[1][q]) + (acc[2][q] + acc[3][q])) + ((acc[4][q] + acc[5][q]) + (acc[6][q] + acc[7][q]));
     if (tid == 0 && s == 0 && trace) trace[G * 8 + 9] = clock64() + (c[0] == 1.2345f);
     // c0 = (row g, token 2tig), c1 = (g, 2tig+1), c2 = (g+8, 2tig), c3 = (g+8, 2tig+1)
-    float* pw = part + warp * 16 * kRtMaxM;
+    float* pw = part + warp * 16 * M;
     for (int q = 0; q < 2; ++q) {
       const int n = 2 * tig + q;
       if (n < M) {
-        pw[g * kRtMaxM + n] = c[q];
-        pw[(g + 8) * kRtMaxM + n] = c[2 + q];
+        pw[g * M + n] = c[q];
+        pw[(g + 8) * M + n] = c[2 + q];
       }
     }
   }
@@ -1275,21 +1372,23 @@ route_shared_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __
     const int r = tid / M, n = tid % M;
     float v = 0.f;
 #pragma unroll
-    for (int w = 0; w < kRtWarps; ++w) v += part[(w * 16 + r) * kRtMaxM + n];
-    rowv[r * kRtMaxM + n] = v;
-    if (r < nr) {
+    for (int w = 0; w < kRtWarps; ++w) v += part[(w * 16 + r) * M + n];
+    rowv[r * M + n] = v;
+    const int gr = fa + r;
+    if (r < nrows && gr >= kRtE) h_sh[n * (2 * kRtSh) + gr - kRtE] = __float2bfloat16(v);  // gate_up (bf16)
+    if (r < nrows && gr < kRtE) {
       const float sc = 1.f / (1.f + expf(-v));
       float sb = sc + my_bias;
       uint2 pk = make_uint2(__float_as_uint(sc), __float_as_uint(sb));
       if (pk.x == kRtEmpty || pk.y == kRtEmpty || isnan(sc) || isnan(sb))  // never publish the marker
         pk = make_uint2(0u, __float_as_uint(-INFINITY));
       if (select) {
-        asm volatile("st.global.v2.u32 [%0], {%1, %2};" ::"l"(sbuf + n * kRtE + ra + r), "r"(pk.x), "r"(pk.y)
+        asm volatile("st.global.v2.u32 [%0], {%1, %2};" ::"l"(sbuf + n * kRtE + gr), "r"(pk.x), "r"(pk.y)
                      : "memory");
       } else {
 #pragma unroll
         for (int c = 0; c < kRtReplicas; ++c)
-          asm volatile("st.global.v2.u32 [%0], {%1, %2};" ::"l"(sbuf + (c * M + n) * kRtE + ra + r), "r"(pk.x),
+          asm volatile("st.global.v2.u32 [%0], {%1, %2};" ::"l"(sbuf + (c * M + n) * kRtE + gr), "r"(pk.x),
                        "r"(pk.y)
                        : "memory");
       }
@@ -1298,14 +1397,6 @@ route_shared_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __
   __syncthreads();
   RT_CK(11)
   RT_MARK(3)
-  if (tid < np * M) {
-    const int p = tid / M, n = tid % M;
-    const float gv = __bfloat162float(__float2bfloat16(rowv[(nr + p) * kRtMaxM + n]));
-    const float uv = __bfloat162float(__float2bfloat16(rowv[(nr + np + p) * kRtMaxM + n]));
-    const float ga = beta * tanhf(gv / beta) * (1.f / (1.f + expf(-gv)));
-    const float ua = linear_beta > 0.f ? linear_beta * tanhf(uv / linear_beta) : uv;
-    h_sh[n * kRtSh + pa + p] = __float2bfloat16(ga * ua);
-  }
   if (s != 0 || !select) return;
 
   // ---- CTA 0: gather the Lamport scores and select the top-16 per token -------------------
@@ -1340,8 +1431,8 @@ route_shared_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __
   // Falls back to an exact MSB-first radix select if the candidate set is too large.
   float* red = reinterpret_cast<float*>(hist);            // [2][8][2] (min/max per warp)
   unsigned* hist2 = reinterpret_cast<unsigned*>(xs);      // [2][1024] (x is no longer needed)
-  __shared__ int s_ci[kRtMaxM][64];
-  __shared__ uint32_t s_ck[kRtMaxM][64];
+  __shared__ int s_ci[kRtSelMaxM][64];
+  __shared__ uint32_t s_ck[kRtSelMaxM][64];
   __shared__ int s_fast;
   const int wg = lt >> 5;
   float mx = -INFINITY, mn = INFINITY;
@@ -1569,7 +1660,7 @@ void route_shared(torch::Tensor x, torch::Tensor gate_w, torch::Tensor bias,
                   torch::Tensor wts, std::optional<torch::Tensor> h_shared, double beta, double linear_beta,
                   bool renormalize, double routed_scaling_factor, std::optional<torch::Tensor> trace) {
   const int M = x.size(0);
-  TORCH_CHECK(M >= 1 && M <= kRtMaxM, "route_shared supports 1..2 tokens");
+  TORCH_CHECK(M >= 1 && M <= kRtMaxM, "route_shared supports 1..4 tokens");
   TORCH_CHECK(x.dim() == 2 && x.size(1) == kRtH && x.scalar_type() == at::kBFloat16 && x.is_contiguous());
   TORCH_CHECK(gate_w.size(0) == kRtE && gate_w.size(1) == kRtH && gate_w.scalar_type() == at::kBFloat16 &&
               gate_w.is_contiguous());
@@ -1579,6 +1670,7 @@ void route_shared(torch::Tensor x, torch::Tensor gate_w, torch::Tensor bias,
   // ids/wts empty -> scores-only mode: sbuf receives plain (score, score + bias) pairs [M][896]
   // for moe_block_lamport (no Lamport markers, no selection here).
   const bool select = ids.numel() > 0;
+  TORCH_CHECK(!select || M <= kRtSelMaxM, "route_shared select mode supports 1..2 tokens");
   TORCH_CHECK(!select || (ids.numel() == M * 16 && ids.scalar_type() == at::kInt && ids.is_contiguous()));
   TORCH_CHECK(!select || (wts.numel() == M * 16 && wts.scalar_type() == at::kBFloat16 && wts.is_contiguous()));
   const __nv_bfloat16* w13p = nullptr;
@@ -1587,21 +1679,25 @@ void route_shared(torch::Tensor x, torch::Tensor gate_w, torch::Tensor bias,
     TORCH_CHECK(h_shared.has_value());
     TORCH_CHECK(sh_w13->size(0) == 2 * kRtSh && sh_w13->size(1) == kRtH &&
                 sh_w13->scalar_type() == at::kBFloat16 && sh_w13->is_contiguous());
-    TORCH_CHECK(h_shared->numel() == M * kRtSh && h_shared->scalar_type() == at::kBFloat16 &&
-                h_shared->is_contiguous());
+    TORCH_CHECK(h_shared->numel() == M * 2 * kRtSh && h_shared->scalar_type() == at::kBFloat16 &&
+                h_shared->is_contiguous(), "h_shared: shared gate_up output [M, 768] bf16");
     w13p = reinterpret_cast<const __nv_bfloat16*>(sh_w13->data_ptr());
     hp = reinterpret_cast<__nv_bfloat16*>(h_shared->data_ptr());
   }
   static int sms = 0;
-  const size_t smem = kRtRows * kRtRowStride + kRtMaxM * kRtH * 2 + (kRtWarps * 16 * kRtMaxM + 16 * kRtMaxM) * 4 +
-                      kRtMaxM * kRtE * 8 + kRtMaxM * 256 * 4 + kRtMaxM * 4 * 4 + kRtMaxM * 16 * 4 + 16 + 16;
+  auto smem_for = [](int m, int sel_m) {
+    return static_cast<size_t>(kRtRows * kRtRowStride + m * kRtH * 2 + (kRtWarps * 16 * m + 16 * m) * 4 +
+                               sel_m * (kRtE * 8 + 256 * 4 + 4 * 4 + 16 * 4) + 16 + 16);
+  };
+  const size_t smem = smem_for(M, select ? M : 0);
   if (sms == 0) {
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, x.get_device());
     C10_CUDA_CHECK(cudaFuncSetAttribute(route_shared_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem)));
+                                        static_cast<int>(std::max(smem_for(kRtMaxM, 0),
+                                                                  smem_for(kRtSelMaxM, kRtSelMaxM)))));
   }
   const int G = std::min(sms, 152);
-  TORCH_CHECK(G >= 150, "route_shared needs >= 150 SMs (<= 12 rows per CTA)");
+  TORCH_CHECK(G >= 152, "route_shared needs >= 152 SMs (<= 11 rows per CTA)");
   cudaLaunchConfig_t cfg{};
   cfg.gridDim = dim3(G);
   cfg.blockDim = dim3(kRtThreads);
@@ -1679,22 +1775,29 @@ void moe_block_lamport(torch::Tensor mailbox, torch::Tensor scores, torch::Tenso
                        torch::Tensor gemm2_out, torch::Tensor ids_out, torch::Tensor wts_out,
                        torch::Tensor h_shared, torch::Tensor w_sd, torch::Tensor shared_out, double beta,
                        double linear_beta, bool renormalize, double routed_scaling_factor, int64_t grid,
-                       std::optional<torch::Tensor> trace) {
+                       double shared_beta, double shared_linear_beta, std::optional<torch::Tensor> trace,
+                       std::optional<torch::Tensor> latent_out) {
   const int M = ids_out.size(0);
-  TORCH_CHECK(M >= 1 && M <= 2, "moe_block_lamport supports 1..2 tokens");
+  TORCH_CHECK(M >= 1 && M <= kBlockMaxM, "moe_block_lamport supports 1..4 tokens");
   TORCH_CHECK(ids_out.dim() == 2 && ids_out.size(1) == kTopK && ids_out.scalar_type() == at::kInt &&
               ids_out.is_contiguous());
   TORCH_CHECK(wts_out.numel() == M * kTopK && wts_out.scalar_type() == at::kBFloat16 && wts_out.is_contiguous());
   TORCH_CHECK(scores.numel() * scores.element_size() >= 8 * M * 896 * 8 && scores.is_contiguous(),
               "scores: route_shared scores-only output [8 replicas, M, 896, 2] fp32");
-  TORCH_CHECK(h_shared.numel() == M * kSdK && h_shared.scalar_type() == at::kBFloat16 && h_shared.is_contiguous());
+  TORCH_CHECK(h_shared.numel() == M * 2 * kSdK && h_shared.scalar_type() == at::kBFloat16 && h_shared.is_contiguous(),
+              "h_shared: route_shared's shared gate_up output [M, 768] bf16");
   TORCH_CHECK(w_sd.size(0) == kSdRows && w_sd.size(1) == kSdK && w_sd.scalar_type() == at::kBFloat16 &&
               w_sd.is_contiguous());
   TORCH_CHECK(shared_out.numel() == M * kSdRows && shared_out.scalar_type() == at::kBFloat16 &&
               shared_out.is_contiguous());
-  TORCH_CHECK(gemm2_out.size(0) == M * kTopK && gemm2_out.size(1) == kHidden &&
-              gemm2_out.scalar_type() == at::kBFloat16 && gemm2_out.is_contiguous());
+  TORCH_CHECK(latent_out.has_value() ||
+              (gemm2_out.dim() == 2 && gemm2_out.size(0) == M * kTopK && gemm2_out.size(1) == kHidden &&
+               gemm2_out.scalar_type() == at::kBFloat16 && gemm2_out.is_contiguous()));
+  if (latent_out)
+    TORCH_CHECK(latent_out->numel() == M * kHidden && latent_out->scalar_type() == at::kBFloat16 &&
+                latent_out->is_contiguous(), "latent_out: [M, 3584] bf16");
   BlockArgs ba{};
+  ba.latent_out = latent_out ? reinterpret_cast<__nv_bfloat16*>(latent_out->data_ptr()) : nullptr;
   ba.scores = reinterpret_cast<const uint2*>(scores.data_ptr());
   ba.ids_out = ids_out.data_ptr<int>();
   ba.wts_out = reinterpret_cast<__nv_bfloat16*>(wts_out.data_ptr());
@@ -1703,6 +1806,8 @@ void moe_block_lamport(torch::Tensor mailbox, torch::Tensor scores, torch::Tenso
   ba.sh_out = reinterpret_cast<__nv_bfloat16*>(shared_out.data_ptr());
   ba.rscale = static_cast<float>(routed_scaling_factor);
   ba.renorm = renormalize ? 1 : 0;
+  ba.sh_beta = static_cast<float>(shared_beta);
+  ba.sh_lbeta = static_cast<float>(shared_linear_beta);
   launch_fused<false, true, true>(mailbox, ids_out, nullptr, w13, w13_scale, w2, w2_scale, workspace, barrier,
                                   reinterpret_cast<__nv_bfloat16*>(gemm2_out.data_ptr()), beta, linear_beta,
                                   trace, 0, ba, static_cast<int>(grid));
@@ -1730,7 +1835,8 @@ TORCH_LIBRARY(k3moe, m) {
   m.def("moe_block_lamport(Tensor(a!) mailbox, Tensor scores, Tensor w13, Tensor w13_scale, Tensor w2, "
         "Tensor w2_scale, Tensor(b!) workspace, Tensor(c!) barrier, Tensor(d!) gemm2_out, Tensor(e!) ids_out, "
         "Tensor(f!) wts_out, Tensor h_shared, Tensor w_sd, Tensor(g!) shared_out, float beta, float linear_beta, "
-        "bool renormalize, float routed_scaling_factor, int grid=0, Tensor(h!)? trace=None) -> ()");
+        "bool renormalize, float routed_scaling_factor, int grid=0, float shared_beta=4.0, "
+        "float shared_linear_beta=25.0, Tensor(h!)? trace=None, Tensor(i!)? latent_out=None) -> ()");
   m.def("topk_debug(Tensor scores, Tensor(a!) ids, Tensor(b!) sc, Tensor(c!) tr) -> ()");
   m.def("moe_fused_unfinalized_lamport(Tensor(a!) mailbox, Tensor topk_ids, Tensor w13, Tensor w13_scale, "
         "Tensor w2, Tensor w2_scale, Tensor(b!) workspace, Tensor(c!) barrier, Tensor(d!) gemm2_out, "

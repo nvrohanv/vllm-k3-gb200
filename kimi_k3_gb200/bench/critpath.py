@@ -17,7 +17,9 @@ top = int(sys.argv[sys.argv.index("--top") + 1]) if "--top" in sys.argv else 30
 events = json.load(gzip.open(path, "rt"))["traceEvents"]
 kernels = sorted((e for e in events if e.get("ph") == "X" and e.get("cat") in ("kernel", "gpu_memcpy")),
                  key=lambda e: e["ts"])
-main_tid = collections.Counter(e["tid"] for e in kernels).most_common(1)[0][0]
+# Main (graph-replay) stream = the one running the MoE-tail collective; fall back to the busiest.
+_tail = collections.Counter(e["tid"] for e in kernels if "allreduce_rmsnorm_reduce_scatter" in e["name"])
+main_tid = (_tail or collections.Counter(e["tid"] for e in kernels)).most_common(1)[0][0]
 # Step marker: the embedding kernel, which may run on another stream than the
 # graph-replay main stream. Mark the first main-stream kernel after each one.
 emb_ts = [e["ts"] for e in kernels if "vocab_parallel_embedding" in e["name"]]

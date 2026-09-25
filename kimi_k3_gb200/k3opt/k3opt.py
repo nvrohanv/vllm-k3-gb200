@@ -283,12 +283,14 @@ def _patch_moe_fused():
 
     _load_ext()
     max_m = int(os.environ.get("K3OPT_MOEFUSED_MAX_M", "2"))
+    use_moe8 = _flag("K3OPT_MOE8")
     seen = set()
 
     def _count_moefused(m):
         if m not in seen:
             seen.add(m)
-            print(f"[k3opt] K3OPT_MOEFUSED: first unfinalized fused MoE call at M={m}", flush=True)
+            print(f"[k3opt] K3OPT_MOEFUSED: first unfinalized fused MoE call at M={m}"
+                  f"{' (k3moe8 tensor-core kernel)' if use_moe8 else ''}", flush=True)
     Impl = mk.FusedMoEKernelMonolithicImpl
     orig_apply = Impl.apply
 
@@ -345,8 +347,18 @@ def _patch_moe_fused():
             ident = torch.arange(m * topk, dtype=torch.int32, device=dev).view(m, topk)
             _fused_state[("ident", m, topk)] = ident
         gemm2_out = torch.empty(m * topk, 3584, dtype=torch.bfloat16, device=dev)
-        torch.ops.k3moe.moe_fused_unfinalized(hidden_states.contiguous(), topk_ids, *w, workspace,
-                                              _fused_state["barrier"], gemm2_out, betas[0], betas[1])
+        if use_moe8:
+            # K3OPT_MOE8: tcgen05 block-scaled MXFP4 MoE (agents/moe8). Its workspace is armed
+            # with 0xFF once and re-armed by the kernel itself; shared by all layers (in-order).
+            ws8 = _fused_state.get("moe8_ws")
+            if ws8 is None:
+                ws8 = torch.full((torch.ops.k3moe8.workspace_bytes(),), 0xFF, dtype=torch.uint8, device=dev)
+                _fused_state["moe8_ws"] = ws8
+            torch.ops.k3moe8.moe_fused_unfinalized(hidden_states.contiguous(), topk_ids, *w, ws8,
+                                                   _fused_state["barrier"], gemm2_out, betas[0], betas[1])
+        else:
+            torch.ops.k3moe.moe_fused_unfinalized(hidden_states.contiguous(), topk_ids, *w, workspace,
+                                                  _fused_state["barrier"], gemm2_out, betas[0], betas[1])
         _count_moefused(m)
         return UnfinalizedMoEOutput(gemm2_permuted=gemm2_out,
                                     expert_weights=topk_weights_bf16,

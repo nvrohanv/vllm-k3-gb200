@@ -20,12 +20,12 @@ done
 # k3opt CUDA extension: stage sources and build once per tray (cached on local NVMe).
 if [[ -f ${CFG}/k3opt_build.py ]]; then
   mkdir -p /tmp/k3opt/csrc
-  cp -p ${CFG}/*.cu ${CFG}/*.h /tmp/k3opt/csrc/  # -p: unchanged sources keep mtimes -> no rebuild
+  cp -p ${CFG}/*.cu ${CFG}/*.h ${CFG}/*.cuh /tmp/k3opt/csrc/  # -p: unchanged sources keep mtimes -> no rebuild
   cp ${CFG}/k3opt_build.py /tmp/k3opt/build.py
   # A build killed mid-way leaves torch's file lock behind and every later
   # build waits on it forever; this is the only builder in the pod.
   rm -f "${TORCH_EXTENSIONS_DIR:-/root/.cache/torch_extensions}"/*/*/lock
-  if env | grep -qE '^K3OPT_(KDA6|ATTN_RES|MOEFUSED|ARRES|TAILATTN|MLA|L2PF|GEMV|KDASPLIT|KDAFB|OPROJ|MOEBLOCK)=1'; then
+  if env | grep -qE '^K3OPT_(KDA6|ATTN_RES|MOEFUSED|ARRES|TAILATTN|MLA|L2PF|GEMV|KDASPLIT|KDAFB|OPROJ|MOEBLOCK|MOE8)=1'; then
     K3OPT_SRC=/tmp/k3opt/csrc python3 /tmp/k3opt/build.py 2>&1 | tail -2
   fi
 fi
