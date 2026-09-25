@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **188.7 (5.301 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **339.9 (5.885 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **564.1 (7.091 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **904.1 (8.848 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **189.6 (5.275 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **343.6 (5.821 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **567.7 (7.046 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **905.7 (8.833 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -70,6 +70,12 @@ source files are edited; the patches are installed at plugin registration.
     Gumbel-max over its vocab shard, and one NVLS mailbox exchange of (value, id) picks the token.
     Sampled ids are bit-identical to vLLM's on all 16 ranks. Otherwise, a one-hop NVLS all-gather
     replaces NCCL's ring for the logits. This removes ~60–100 µs of per-step eager work.
+  - `K3OPT_STEPOV=1` (`csrc/k3step.cu`, `k3step_prep.cu`, `stepov_patch.py`; supersedes `K3OPT_STEP`),
+    which trims the per-step work outside the CUDA graph:
+    - distributed sampling with vLLM's post-update and mamba scatter fused into the finish kernel;
+    - an NVLS embedding broadcast that replaces the masked gather + all-reduce;
+    - input-prep caching;
+    - an lm_head L2 prefetch.
   - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`): two fused cluster kernels replace 8 in the MLA
     decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate). The dispatch is
     decided inside an eager-break function, so it is correct under breakable piecewise graphs.
@@ -130,7 +136,8 @@ source files are edited; the patches are installed at plugin registration.
 | + distributed sampling / NVLS logits gather (`stepB`) | 5.454 | 8.970 (B=4 7.257) |
 | + faster k3mla (early PDL release, bulk loads, fewer cluster syncs) + split o_proj on MLA layers (`mla2`) | 5.370 | 8.870 (B=4 7.123) |
 | + MoE block kernel shared-memory addressing fix (`smemfix`) | 5.329 | 8.848 (B=4 7.118) |
-| + L2 prefetch launched without PDL (layer 1's could linger ~200 us and block layer 2's MoE kernel) | **5.301** | 8.874 (B=4 **7.091**) |
+| + L2 prefetch launched without PDL (layer 1's could linger ~200 us and block layer 2's MoE kernel) | 5.301 | 8.874 (B=4 7.091) |
+| + step-overhead trims (`stepov`) | **5.275** | **8.833** (B=2 **5.821**, B=4 **7.046**) |
 
 Next: per-layer persistent kernels (ATTN / MOE / TAIL). See `DESIGN_PLAN.md` for the plan to get B=1/B=2 past the TPU.
 

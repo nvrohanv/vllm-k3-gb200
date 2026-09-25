@@ -7,7 +7,7 @@ from torch.utils.cpp_extension import load
 
 SRC_DIR = os.environ.get("K3OPT_SRC", os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc"))
 # One extension per kernel file, so editing one kernel only rebuilds that one.
-SOURCES = ["kda_decode6.cu", "moe_small.cu", "ar_attn_res.cu", "lamport_attn_res.cu", "k3mla.cu", "kda_split.cu", "l2pf.cu", "k3gemv.cu", "oproj_ar.cu", "moe8.cu", "k3samp.cu"]
+SOURCES = ["kda_decode6.cu", "moe_small.cu", "ar_attn_res.cu", "lamport_attn_res.cu", "k3mla.cu", "kda_split.cu", "l2pf.cu", "k3gemv.cu", "oproj_ar.cu", "moe8.cu", "k3samp.cu", "k3step.cu", "k3step_prep.cu"]
 
 
 def build(verbose: bool = False, only=None):
