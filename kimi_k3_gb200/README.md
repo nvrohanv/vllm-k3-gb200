@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **173.4 (5.769 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **299.3 (6.682 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **481.2 (8.313 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **787.8 (10.155 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **185.8 (5.383 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **330.4 (6.052 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **481.6 (8.305 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **787.5 (10.159 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -43,6 +43,12 @@ source files are edited; the patches are installed at plugin registration.
     multicasts each rank's partial into a Lamport mailbox on all 16 GPUs, and the consumer sums the 16
     slots in a fixed order and runs the post-attention AttnRes. o_proj + all-reduce + AttnRes become
     one PDL kernel.
+  - `K3OPT_MOEBLOCK=1` (`moeblock_patch.py`, kernels in `csrc/moe_small.cu`): for M ≤ 2 the MoE
+    block becomes two main-stream kernels, replacing nine:
+    - `route_shared`: router GEMV + scores + shared-expert gate_up/SiTU;
+    - `moe_block_lamport`: in-kernel top-16, latent polled straight from the down-shard Lamport
+      mailbox, FC1/FC2, and shared down.
+    The side stream only runs the down-shard multicast producer.
   - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`): two fused cluster kernels replace 8 in the MLA
     decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate). The dispatch is
     decided inside an eager-break function, so it is correct under breakable piecewise graphs.
@@ -76,3 +82,4 @@ source files are edited; the patches are installed at plugin registration.
 | + MLA + L2PF (`combo5g`) | 6.404 | 10.822 |
 | + KDAFB | 6.283 | 10.615 |
 | + OPROJ (fused o_proj + NVLS all-reduce + AttnRes) | 5.769 | 10.155 |
+| + MOEBLOCK (M ≤ 2) | 5.383 | 10.159 |

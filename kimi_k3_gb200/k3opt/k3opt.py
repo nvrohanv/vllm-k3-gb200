@@ -499,12 +499,18 @@ def register():
     if _flag("K3OPT_MLA"):
         from mla_patch import patch_mla
         patch_mla(_load_ext)
+    if _flag("K3OPT_MOEBLOCK"):
+        from moeblock_patch import patch_moeblock
+        patch_moeblock(_load_ext)
     if _flag("K3OPT_OPROJ"):
         from oproj_patch import patch_oproj
         patch_oproj(_load_ext)
     if _flag("K3OPT_L2PF"):
         from l2pf_patch import patch_l2pf
         patch_l2pf(_load_ext)
+    if _flag("K3OPT_PLANS"):
+        from plans_patch import patch_plans
+        patch_plans()
     if _flag("K3OPT_GEMV"):
         from gemv_patch import patch_gemv
         patch_gemv(_load_ext)
