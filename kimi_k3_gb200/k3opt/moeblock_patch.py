@@ -27,6 +27,17 @@ MoE kernel) and moe_fused_unfinalized: 9 kernels -> 3 (+ the unchanged producer 
 Everything else (M > 2, prefill, MegaMoE, sequence parallel, non-latent MoE, other quant
 layouts, missing tail fusion, zero-expert routers, unexpected shapes/dtypes, breakable-graph
 capture for the stream split) falls back to the original forward, or to a single-stream variant.
+
+MoE-tail replacement (experimental, default off; K3MOEBLOCK_TAIL=fused|kernel, TP16, M <= 4):
+    kernel  after the MoE kernel (moe_block_lamport or k3moe8): k3moe.moe_tail, ONE 7x8-CTA
+            cluster kernel doing vLLM's CollectiveKernel + AdaptiveUpProjectionKernel (top-16
+            finalize, NVLS latent all-reduce, RMSNorm, shared reduce-scatter, up-proj, multicast into
+            vLLM's up-proj mailbox) with the same rounding points
+    fused   (only where the block kernel runs FC1/FC2 itself, i.e. not the k3moe8 path)
+            k3moe.moe_block_tail: the same tail inside the persistent MoE kernel
+    Either writes vLLM's up-proj mailbox; the result is handed to tailattn's deferred consumer
+    (mailbox view) when the runner is flagged for it, else copied out with vLLM's LamportCopy.
+    Needs two extra symmetric mailboxes (allocated collectively in KimiMoE.__init__).
 """
 
 from __future__ import annotations
@@ -49,6 +60,54 @@ _SH = 384
 
 def _enabled() -> bool:
     return os.environ.get("K3MOEBLOCK_DISABLE", "0") != "1"
+
+
+_TAIL_MODE = os.environ.get("K3MOEBLOCK_TAIL", "0").strip().lower()
+if _TAIL_MODE in ("0", "", "off", "none"):
+    _TAIL_MODE = ""
+_TAIL = {}  # symmetric mailboxes + scratch for the tail replacement (one set per process)
+_KEEPALIVE: list = []  # inputs of the last tail call (the PDL consumer may start early; see tailattn)
+
+
+def _tail_buffers():
+    """Collective (all TP ranks, at model construction): mailboxes of k3moe.moe_tail / moe_block_tail."""
+    if "lat" in _TAIL:
+        return _TAIL
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group().device_group
+    tp = dist.get_world_size(group)
+    if tp != 16:
+        _TAIL["lat"] = None
+        return _TAIL
+    dev = torch.device("cuda", torch.cuda.current_device())
+
+    def pair():
+        lat = symm_mem.empty((2, 4, 16, _LAT), dtype=torch.bfloat16, device=dev)
+        lat_h = symm_mem.rendezvous(lat, group.group_name)
+        rs = symm_mem.empty((2, 4, 16, 448), dtype=torch.bfloat16, device=dev)
+        rs_h = symm_mem.rendezvous(rs, group.group_name)
+        lat.view(torch.int32).fill_(-0x80000000)
+        rs.view(torch.int32).fill_(-0x80000000)
+        mc = int(lat_h.multicast_ptr or 0)
+        peers = [rs_h.get_buffer(d, tuple(rs.shape), torch.bfloat16).data_ptr() for d in range(tp)]
+        return lat, mc, rs, peers
+
+    # moe_tail (deferred re-arm, buffer = device call counter parity) and moe_block_tail (immediate
+    # re-arm, buffer = layer parity) keep separate mailboxes: their protocols must not mix.
+    lat, mc, rs, peers = pair()
+    lat_f, mc_f, rs_f, peers_f = pair() if _TAIL_MODE == "fused" else (None, 1, None, [1])
+    torch.cuda.synchronize()
+    if mc == 0 or mc_f == 0 or any(p == 0 for p in peers + peers_f):
+        _TAIL["lat"] = None
+        return _TAIL
+    _TAIL.update(lat=lat, lat_mc=mc, rs=rs, rs_peers=peers, rank=dist.get_rank(group),
+                 counter=torch.zeros(1, dtype=torch.int64, device=dev),
+                 lat_f=lat_f, lat_f_mc=mc_f, rs_f=rs_f, rs_f_peers=peers_f,
+                 fused_ws=torch.zeros(1 << 20, dtype=torch.uint8, device=dev))
+    return _TAIL
 
 
 def _grid() -> int:
@@ -154,7 +213,29 @@ def _build_layer_state(moe):
     op, _copy = k3._down_shard_ops()
     st = k3._down_state
     shard = _LAT // st["tp"]
+    tail = None
+    if _TAIL_MODE in ("fused", "kernel"):
+        tb = _tail_buffers()
+        top = getattr(runner, "_k3_latent_moe_tail_op", None)
+        transform = getattr(runner, "routed_output_transform", None)
+        if tb.get("lat") is None or top is None or transform is None or getattr(transform, "norm", None) is None:
+            print(f"[k3opt] K3MOEBLOCK_TAIL: layer {getattr(moe, 'layer_idx', '?')} keeps vLLM's tail "
+                  f"(no TP16 multicast / tail op)", flush=True)
+        elif top.contract.tp_size != 16 or top.rank != tb["rank"]:
+            print("[k3opt] K3MOEBLOCK_TAIL: tail op group mismatch, keeping vLLM's tail", flush=True)
+        else:
+            up = transform.up_proj.weight
+            gamma = transform.norm.weight
+            if (up.dtype == torch.bfloat16 and tuple(up.shape) == (_H, _LAT) and up.is_contiguous()
+                    and gamma.dtype == torch.bfloat16 and gamma.numel() == _LAT and gamma.is_contiguous()):
+                upp = top._up_projection
+                tail = dict(op=top, w_up=up.narrow(0, top.rank * 448, 448), gamma=gamma,
+                            eps=float(top.contract.rms_eps), mb=upp._mailbox, mb_mc=int(upp._mailbox_multicast_ptr),
+                            parity=int(getattr(moe, "layer_idx", 0) or 0) & 1)
+            else:
+                print("[k3opt] K3MOEBLOCK_TAIL: up_proj / norm layout, keeping vLLM's tail", flush=True)
     return dict(
+        tail=tail,
         runner=runner,
         gate_w=gw, bias=gb.data.contiguous(),
         sh_w13=w13s, sh_down=wds, sh_beta=float(act.beta),
@@ -217,7 +298,17 @@ def _forward_small(moe, s, hidden_states):
     gemm2 = torch.empty(m * _TOPK, _LAT, dtype=torch.bfloat16, device=dev)
     shared_out = torch.empty(m, _H, dtype=torch.bfloat16, device=dev)
     workspace = torch.empty(m * _TOPK * 192, dtype=torch.float16, device=dev)
-    if _moe8_enabled(m):
+    tail = s.get("tail")
+    use_fused_tail = tail is not None and _TAIL_MODE == "fused" and not _moe8_enabled(m)
+    if use_fused_tail:
+        tb = _TAIL
+        buf = tail["parity"]
+        K.moe_block_tail(mailbox, scores, *s["w"], workspace, _barrier(dev), ids, wts, h_sh, s["sh_down"],
+                         tb["lat_f"][buf], tb["lat_f_mc"] + buf * tb["lat_f"][0].numel() * 2, tb["rs_f"][buf],
+                         [p + buf * tb["rs_f"][0].numel() * 2 for p in tb["rs_f_peers"]], tail["mb"], tail["mb_mc"],
+                         tail["w_up"], tail["gamma"], tb["fused_ws"], tail["eps"], tb["rank"], tb.get("multicast", True),
+                         s["betas"][0], s["betas"][1], s["renorm"], s["scale"], _grid(), s["sh_beta"], s["sh_lbeta"])
+    elif _moe8_enabled(m):
         # Routing-only block kernel (top-k, shared expert, latent hand-off + mailbox re-arm),
         # then the tcgen05 MXFP4 MoE (agents/moe8) for FC1/FC2.
         latent = torch.empty(m, _LAT, dtype=torch.bfloat16, device=dev)
@@ -230,13 +321,32 @@ def _forward_small(moe, s, hidden_states):
         K.moe_block_lamport(mailbox, scores, *s["w"], workspace, _barrier(dev), gemm2, ids, wts, h_sh,
                             s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"],
                             s["scale"], _grid(), s["sh_beta"], s["sh_lbeta"])
+    runner = s["runner"]
+    if tail is not None:
+        # K3OPT_L2PF: same fork point as below (after FC2, before the tail)
+        try:
+            import l2pf_patch
+            if l2pf_patch._STATE["patched"]:
+                l2pf_patch.launch_after_moe(runner, m)
+        except ImportError:
+            pass
+        if not use_fused_tail:
+            tb = _TAIL
+            K.moe_tail(gemm2, wts, shared_out, tail["w_up"], tail["gamma"], tb["lat"], tb["lat_mc"], tb["rs"],
+                       tb["rs_peers"], tail["mb"], tail["mb_mc"], tb["counter"], tail["eps"], tb["rank"],
+                       tb.get("multicast", True))
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, h_sh, scores, workspace]
+        result = _tail_result(runner, tail, m)
+        _STATE["stats"]["tail_" + ("fused" if use_fused_tail else "kernel")] = \
+            _STATE["stats"].get("tail_" + ("fused" if use_fused_tail else "kernel"), 0) + 1
+        _STATE["stats"]["fused"] += 1
+        return result.view(num_tokens, hidden)
     ident = s["ident"].get(m)
     if ident is None:
         ident = torch.arange(m * _TOPK, dtype=torch.int32, device=dev).view(m, _TOPK)
         s["ident"][m] = ident
     fused = UnfinalizedMoEOutput(gemm2_permuted=gemm2, expert_weights=wts, expanded_idx_to_permuted_idx=ident)
     # 4) existing MoE tail (latent reduce + RMSNorm + shared reduce-scatter + up-proj multicast).
-    runner = s["runner"]
     # K3OPT_L2PF hooks LatentMoERunner._forward_impl, which this path bypasses: fork the
     # next layer's L2 prefetch here instead (same point: after FC2, before the tail).
     try:
@@ -251,9 +361,25 @@ def _forward_small(moe, s, hidden_states):
     return result.view(num_tokens, hidden)
 
 
+def _tail_result(runner, tail, m):
+    """The [m, 7168] MoE output from vLLM's up-proj mailbox (written by our tail kernel)."""
+    mb = tail["mb"]
+    if getattr(runner, "_k3tail_defer", False):
+        try:  # tailattn: its fused attn_res consumer polls the mailbox view directly
+            import tailattn_patch
+
+            tailattn_patch._register_mailbox(mb, tail["op"]._lamport_copy)
+            tailattn_patch._count("deferred")
+            return runner._maybe_reduce_final_output(mb[0, :m], None, output_is_reduced=True)
+        except ImportError:
+            pass
+    out = tail["op"]._lamport_copy(mb, m=m).squeeze(0)
+    return runner._maybe_reduce_final_output(out, None, output_is_reduced=True)
+
+
 def _register_fakes() -> None:
     # The new ops only mutate their arguments; give torch.compile/functionalization a no-op fake.
-    for name in ("k3moe::route_shared", "k3moe::moe_block_lamport"):
+    for name in ("k3moe::route_shared", "k3moe::moe_block_lamport", "k3moe::moe_block_tail", "k3moe::moe_tail"):
         try:
             torch.library.register_fake(name)(lambda *args, **kwargs: None)
         except Exception:  # noqa: BLE001  (already registered, or no tracing support)
@@ -274,6 +400,16 @@ def patch_moeblock(load_ext) -> None:
     KimiMoE = k3_model.KimiMoE
     orig = KimiMoE.forward
     _STATE["orig_forward"] = orig
+    if _TAIL_MODE in ("fused", "kernel"):
+        if not (hasattr(torch.ops.k3moe, "moe_tail") and hasattr(torch.ops.k3moe, "moe_block_tail")):
+            raise RuntimeError("K3MOEBLOCK_TAIL needs the k3moe build with moe_tail / moe_block_tail")
+        orig_init = KimiMoE.__init__
+
+        def __init__(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            _tail_buffers()  # collective symmetric-memory setup at model init (every rank, same order)
+
+        KimiMoE.__init__ = __init__
 
     def forward(self, hidden_states):
         m = hidden_states.shape[0]
@@ -288,6 +424,7 @@ def patch_moeblock(load_ext) -> None:
     _STATE["patched"] = True
     print(f"[k3opt] K3MOEBLOCK: fused router/top-k + MoE + shared expert for M<={_MAX_M} "
           f"{'[FC1/FC2 via k3moe8 tcgen05] ' if os.environ.get('K3MOEBLOCK_MOE8', '0') == '1' else ''}"
+          f"{('[tail: ' + _TAIL_MODE + '] ') if _TAIL_MODE else ''}"
           f"(grid={_grid() or 'all SMs'})", flush=True)
 
 
