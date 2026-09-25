@@ -7,9 +7,9 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **187.7 (5.329 ms)** | 249 | 311 (3.2 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **188.7 (5.301 ms)** | 249 | 311 (3.2 ms) |
 | 2 | 227 | 229.4 (8.72 ms) | **339.9 (5.885 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **562.0 (7.118 ms)** | 515 | 644 |
+| 4 | 373 | 384.6 (10.40 ms) | **564.1 (7.091 ms)** | 515 | 644 |
 | 8 | 636 | 663.3 (12.06 ms) | **904.1 (8.848 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
@@ -129,7 +129,8 @@ source files are edited; the patches are installed at plugin registration.
 | + moe8 FC1/FC2 inside the MoE block for M = 2..4 (`moe8c`) | 5.511 | 9.068 (B=4 7.346) |
 | + distributed sampling / NVLS logits gather (`stepB`) | 5.454 | 8.970 (B=4 7.257) |
 | + faster k3mla (early PDL release, bulk loads, fewer cluster syncs) + split o_proj on MLA layers (`mla2`) | 5.370 | 8.870 (B=4 7.123) |
-| + MoE block kernel shared-memory addressing fix (`smemfix`) | **5.329** | **8.848** (B=4 **7.118**) |
+| + MoE block kernel shared-memory addressing fix (`smemfix`) | 5.329 | 8.848 (B=4 7.118) |
+| + L2 prefetch launched without PDL (layer 1's could linger ~200 us and block layer 2's MoE kernel) | **5.301** | 8.874 (B=4 **7.091**) |
 
 Next: per-layer persistent kernels (ATTN / MOE / TAIL). See `DESIGN_PLAN.md` for the plan to get B=1/B=2 past the TPU.
 

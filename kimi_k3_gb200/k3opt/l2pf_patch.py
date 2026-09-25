@@ -70,6 +70,7 @@ MAX_TOKENS = int(os.environ.get("K3PF_MAX_TOKENS", "16"))
 # K3PF_MODE=tma (opt-in): TMA bulk-load fill (policy 4), 64 CTAs x 128 KB smem ring for ~9 us; ~1 us/layer
 #   faster GEMMs in the emulation but occupies smem on 64 SMs during the MoE tail -- validate in the real chain.
 MODE = os.environ.get("K3PF_MODE", "prefetch")
+PDL = int(os.environ.get("K3PF_PDL", "0"))
 GRID = int(os.environ.get("K3PF_GRID", "64" if MODE == "tma" else "32"))
 CHUNK = int(os.environ.get("K3PF_CHUNK", "32768" if MODE == "tma" else "16384"))
 POLICY = 4 if MODE == "tma" else int(os.environ.get("K3PF_POLICY", "0"))
@@ -220,10 +221,10 @@ def launch_after_moe(runner, num_tokens: int) -> bool:
     s.wait_event(ev)
     _STATE["pending"] = True  # from here on the side stream must be joined (capture validity)
     with torch.cuda.stream(s):
-        if GRID == 32 and CHUNK == 16384 and POLICY == 0:
-            torch.ops.k3pf.prefetch_l2(rng, n)
-        else:
-            torch.ops.k3pf.prefetch_l2_cfg(rng, n, GRID, CHUNK, POLICY, 1)
+        # K3PF_PDL=1 launches with programmatic serialization. Off by default: the side stream is off
+        # the critical path, and under PDL the first prefetch of a step (layer 1) could start early
+        # and linger ~200 us, holding SMs that layer 2's persistent MoE kernel needs (agents/probe).
+        torch.ops.k3pf.prefetch_l2_cfg(rng, n, GRID, CHUNK, POLICY, PDL)
     _STATE["stats"]["launched"] += 1
     return True
 
