@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **189.6 (5.275 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **343.6 (5.821 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **567.7 (7.046 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **905.7 (8.833 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **193.5 (5.168 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **344.0 (5.814 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **571.1 (7.003 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **906.4 (8.826 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -137,7 +137,8 @@ source files are edited; the patches are installed at plugin registration.
 | + faster k3mla (early PDL release, bulk loads, fewer cluster syncs) + split o_proj on MLA layers (`mla2`) | 5.370 | 8.870 (B=4 7.123) |
 | + MoE block kernel shared-memory addressing fix (`smemfix`) | 5.329 | 8.848 (B=4 7.118) |
 | + L2 prefetch launched without PDL (layer 1's could linger ~200 us and block layer 2's MoE kernel) | 5.301 | 8.874 (B=4 7.091) |
-| + step-overhead trims (`stepov`) | **5.275** | **8.833** (B=2 **5.821**, B=4 **7.046**) |
+| + step-overhead trims (`stepov`) | 5.275 | 8.833 (B=2 5.821, B=4 7.046) |
+| + MoE block "slow mode" fix: routing warps no longer poll the latent, so the top-16 doesn't wait for the last rank's down-shard (`nopoll`) | **5.168** | **8.826** (B=4 **7.003**) |
 
 Next: per-layer persistent kernels (ATTN / MOE / TAIL). See `DESIGN_PLAN.md` for the plan to get B=1/B=2 past the TPU.
 

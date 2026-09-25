@@ -848,30 +848,82 @@ moe_fused_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_const
     if (routed_only) {
       // CTA 0 hands the latent to the next kernel: poll, copy out, re-arm (like LamportCopy).
       if (blockIdx.x == 0) {
-        for (int f = tid; f < M * (kHidden / 8); f += kConsumerThreads) {
+        // Routing warps (12..15) do not poll (see the Lamport poll below); warps 0..11 keep all their fragments
+        // (<= 5 for M <= 4) in flight at once.
+        constexpr int kPT = kTopkWarp0 * 32;
+        constexpr int kMaxF = (kBlockMaxM * (kHidden / 8) + kPT - 1) / kPT;  // 5
+        if (tid < kPT) {
+          const int nf = M * (kHidden / 8);
+          uint4 v[kMaxF];
+          unsigned pend = 0;
+#pragma unroll
+          for (int i = 0; i < kMaxF; ++i)
+            if (tid + i * kPT < nf) pend |= 1u << i;
+          while (pend) {
+#pragma unroll
+            for (int i = 0; i < kMaxF; ++i)
+              if (pend >> i & 1u)
+                asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                             : "=r"(v[i].x), "=r"(v[i].y), "=r"(v[i].z), "=r"(v[i].w)
+                             : "l"(reinterpret_cast<const uint4*>(x) + tid + i * kPT)
+                             : "memory");
+#pragma unroll
+            for (int i = 0; i < kMaxF; ++i)
+              if ((pend >> i & 1u) && v[i].x != 0x80000000u && v[i].y != 0x80000000u && v[i].z != 0x80000000u &&
+                  v[i].w != 0x80000000u) {
+                const int f = tid + i * kPT;
+                reinterpret_cast<uint4*>(ba.latent_out)[f] = v[i];
+                asm volatile("st.global.v4.u32 [%0], {%1, %1, %1, %1};" ::"l"(reinterpret_cast<const uint4*>(x) + f),
+                             "r"(0x80000000u)
+                             : "memory");
+                pend &= ~(1u << i);
+              }
+          }
+        }
+      }
+      mbar_arrive(xbar);
+    } else if constexpr (kLamport) {
+      // Poll this CTA's x rows (<= 2 tokens) out of the mailbox, 16 B per fragment.
+      // Block variant: the routing warps (12..15) do NOT poll x - routing depends only on the
+      // route_shared scores, so it must not wait for the latent. Warps 0..11 poll every fragment, all of a
+      // thread's fragments in flight at once (<= 3 per thread for M <= 2 tokens in a CTA).
+      const int t_lo = W.qa / kPairsPerTok, t_hi = (W.qb - 1) / kPairsPerTok;
+      constexpr int kFrags = kHidden / 8;  // 448
+      constexpr int kPollThreads = kBlock ? kTopkWarp0 * 32 : kConsumerThreads;
+      if (kPollThreads == kConsumerThreads) {
+        for (int f = t_lo * kFrags + tid; f < (t_hi + 1) * kFrags; f += kConsumerThreads) {
           const uint4* src = reinterpret_cast<const uint4*>(x) + f;
           uint4 v;
           do {
             asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
                          : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src) : "memory");
           } while (v.x == 0x80000000u || v.y == 0x80000000u || v.z == 0x80000000u || v.w == 0x80000000u);
-          reinterpret_cast<uint4*>(ba.latent_out)[f] = v;
-          asm volatile("st.global.v4.u32 [%0], {%1, %1, %1, %1};" ::"l"(src), "r"(0x80000000u) : "memory");
+          reinterpret_cast<uint4*>(xs)[f] = v;
         }
-      }
-      mbar_arrive(xbar);
-    } else if constexpr (kLamport) {
-      // Poll this CTA's x rows (<= 2 tokens) out of the mailbox, 16 B per thread per token.
-      const int t_lo = W.qa / kPairsPerTok, t_hi = (W.qb - 1) / kPairsPerTok;
-      constexpr int kFrags = kHidden / 8;  // 448
-      for (int f = t_lo * kFrags + tid; f < (t_hi + 1) * kFrags; f += kConsumerThreads) {
-        const uint4* src = reinterpret_cast<const uint4*>(x) + f;
-        uint4 v;
-        do {
-          asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-                       : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src) : "memory");
-        } while (v.x == 0x80000000u || v.y == 0x80000000u || v.z == 0x80000000u || v.w == 0x80000000u);
-        reinterpret_cast<uint4*>(xs)[f] = v;
+      } else if (tid < kPollThreads) {
+        constexpr int kMaxF = (2 * kFrags + kPollThreads - 1) / kPollThreads;  // 3
+        const int f0 = t_lo * kFrags + tid, f1 = (t_hi + 1) * kFrags;
+        uint4 v[kMaxF];
+        unsigned pend = 0;
+#pragma unroll
+        for (int i = 0; i < kMaxF; ++i)
+          if (f0 + i * kPollThreads < f1) pend |= 1u << i;
+        while (pend) {
+#pragma unroll
+          for (int i = 0; i < kMaxF; ++i)
+            if (pend >> i & 1u)
+              asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                           : "=r"(v[i].x), "=r"(v[i].y), "=r"(v[i].z), "=r"(v[i].w)
+                           : "l"(reinterpret_cast<const uint4*>(x) + f0 + i * kPollThreads)
+                           : "memory");
+#pragma unroll
+          for (int i = 0; i < kMaxF; ++i)
+            if ((pend >> i & 1u) && v[i].x != 0x80000000u && v[i].y != 0x80000000u && v[i].z != 0x80000000u &&
+                v[i].w != 0x80000000u) {
+              reinterpret_cast<uint4*>(xs)[f0 + i * kPollThreads] = v[i];
+              pend &= ~(1u << i);
+            }
+        }
       }
       mbar_arrive(xbar);
       if (tid == 0) K3_MARK(2)
@@ -1721,30 +1773,82 @@ moe_fused_tail_kernel(const __grid_constant__ CUtensorMap tm_w13s, const __grid_
     if (routed_only) {
       // CTA 0 hands the latent to the next kernel: poll, copy out, re-arm (like LamportCopy).
       if (blockIdx.x == 0) {
-        for (int f = tid; f < M * (kHidden / 8); f += kConsumerThreads) {
+        // Routing warps (12..15) do not poll (see the Lamport poll below); warps 0..11 keep all their fragments
+        // (<= 5 for M <= 4) in flight at once.
+        constexpr int kPT = kTopkWarp0 * 32;
+        constexpr int kMaxF = (kBlockMaxM * (kHidden / 8) + kPT - 1) / kPT;  // 5
+        if (tid < kPT) {
+          const int nf = M * (kHidden / 8);
+          uint4 v[kMaxF];
+          unsigned pend = 0;
+#pragma unroll
+          for (int i = 0; i < kMaxF; ++i)
+            if (tid + i * kPT < nf) pend |= 1u << i;
+          while (pend) {
+#pragma unroll
+            for (int i = 0; i < kMaxF; ++i)
+              if (pend >> i & 1u)
+                asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                             : "=r"(v[i].x), "=r"(v[i].y), "=r"(v[i].z), "=r"(v[i].w)
+                             : "l"(reinterpret_cast<const uint4*>(x) + tid + i * kPT)
+                             : "memory");
+#pragma unroll
+            for (int i = 0; i < kMaxF; ++i)
+              if ((pend >> i & 1u) && v[i].x != 0x80000000u && v[i].y != 0x80000000u && v[i].z != 0x80000000u &&
+                  v[i].w != 0x80000000u) {
+                const int f = tid + i * kPT;
+                reinterpret_cast<uint4*>(ba.latent_out)[f] = v[i];
+                asm volatile("st.global.v4.u32 [%0], {%1, %1, %1, %1};" ::"l"(reinterpret_cast<const uint4*>(x) + f),
+                             "r"(0x80000000u)
+                             : "memory");
+                pend &= ~(1u << i);
+              }
+          }
+        }
+      }
+      mbar_arrive(xbar);
+    } else if constexpr (kLamport) {
+      // Poll this CTA's x rows (<= 2 tokens) out of the mailbox, 16 B per fragment.
+      // Block variant: the routing warps (12..15) do NOT poll x - routing depends only on the
+      // route_shared scores, so it must not wait for the latent. Warps 0..11 poll every fragment, all of a
+      // thread's fragments in flight at once (<= 3 per thread for M <= 2 tokens in a CTA).
+      const int t_lo = W.qa / kPairsPerTok, t_hi = (W.qb - 1) / kPairsPerTok;
+      constexpr int kFrags = kHidden / 8;  // 448
+      constexpr int kPollThreads = kBlock ? kTopkWarp0 * 32 : kConsumerThreads;
+      if (kPollThreads == kConsumerThreads) {
+        for (int f = t_lo * kFrags + tid; f < (t_hi + 1) * kFrags; f += kConsumerThreads) {
           const uint4* src = reinterpret_cast<const uint4*>(x) + f;
           uint4 v;
           do {
             asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
                          : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src) : "memory");
           } while (v.x == 0x80000000u || v.y == 0x80000000u || v.z == 0x80000000u || v.w == 0x80000000u);
-          reinterpret_cast<uint4*>(ba.latent_out)[f] = v;
-          asm volatile("st.global.v4.u32 [%0], {%1, %1, %1, %1};" ::"l"(src), "r"(0x80000000u) : "memory");
+          reinterpret_cast<uint4*>(xs)[f] = v;
         }
-      }
-      mbar_arrive(xbar);
-    } else if constexpr (kLamport) {
-      // Poll this CTA's x rows (<= 2 tokens) out of the mailbox, 16 B per thread per token.
-      const int t_lo = W.qa / kPairsPerTok, t_hi = (W.qb - 1) / kPairsPerTok;
-      constexpr int kFrags = kHidden / 8;  // 448
-      for (int f = t_lo * kFrags + tid; f < (t_hi + 1) * kFrags; f += kConsumerThreads) {
-        const uint4* src = reinterpret_cast<const uint4*>(x) + f;
-        uint4 v;
-        do {
-          asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-                       : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(src) : "memory");
-        } while (v.x == 0x80000000u || v.y == 0x80000000u || v.z == 0x80000000u || v.w == 0x80000000u);
-        reinterpret_cast<uint4*>(xs)[f] = v;
+      } else if (tid < kPollThreads) {
+        constexpr int kMaxF = (2 * kFrags + kPollThreads - 1) / kPollThreads;  // 3
+        const int f0 = t_lo * kFrags + tid, f1 = (t_hi + 1) * kFrags;
+        uint4 v[kMaxF];
+        unsigned pend = 0;
+#pragma unroll
+        for (int i = 0; i < kMaxF; ++i)
+          if (f0 + i * kPollThreads < f1) pend |= 1u << i;
+        while (pend) {
+#pragma unroll
+          for (int i = 0; i < kMaxF; ++i)
+            if (pend >> i & 1u)
+              asm volatile("ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];"
+                           : "=r"(v[i].x), "=r"(v[i].y), "=r"(v[i].z), "=r"(v[i].w)
+                           : "l"(reinterpret_cast<const uint4*>(x) + f0 + i * kPollThreads)
+                           : "memory");
+#pragma unroll
+          for (int i = 0; i < kMaxF; ++i)
+            if ((pend >> i & 1u) && v[i].x != 0x80000000u && v[i].y != 0x80000000u && v[i].z != 0x80000000u &&
+                v[i].w != 0x80000000u) {
+              reinterpret_cast<uint4*>(xs)[f0 + i * kPollThreads] = v[i];
+              pend &= ~(1u << i);
+            }
+        }
       }
       mbar_arrive(xbar);
       if (tid == 0) K3_MARK(2)
