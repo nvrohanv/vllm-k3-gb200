@@ -93,7 +93,12 @@ source files are edited; the patches are installed at plugin registration.
   kernel durations overlap their predecessors).
 
 ## Accuracy checks for each change
-- GSM8K 8-shot, first 300 questions: 96.0–97.0% for every stack listed here.
+- Full GSM8K 8-shot (all 1319 questions, greedy):
+  - current best: 1235/1319 = 93.6%;
+  - stock vLLM v0.30.0 recipe on the same harness: 1237/1319 = 93.8%, within noise.
+- GSM8K 8-shot, first 300 questions: 95.0–97.0% for every intermediate stack.
+- Caveat: the work targets decode at B ≤ 8. Prefill- and B=16-heavy workloads were not optimized, and
+  appear slower than stock in the full-GSM8K run (~12 vs ~9 min).
 - Teacher-forced logprobs vs stock, and greedy token match on fixed prompts.
 
 ## History (TPOT ms, B=1 / B=8)
