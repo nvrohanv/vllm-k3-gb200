@@ -133,4 +133,17 @@ source files are edited; the patches are installed at plugin registration.
 
 Next: per-layer persistent kernels (ATTN / MOE / TAIL). See `DESIGN_PLAN.md` for the plan to get B=1/B=2 past the TPU.
 
+Measured primitives on 16 GB200s (wave-1 probe), which update the plan's cost model:
+
+| primitive | measured |
+|---|---|
+| Lamport/NVLS hop, 14 KB, p50 incl. skew | 2.84-3.11 us |
+| in-GPU grid handoff | 1.15 us fence-free (2.08 us with a release counter) |
+| 8-CTA clusters co-resident at <=220 KB smem | 15 |
+| per-boundary residue with PDL | 0.16-0.22 us |
+| DSMEM all-gather, 14 KB | 0.7-0.8 us |
+
+This projects B=1 at about 3.2 ms (range 3.07-3.38; TPU v7 is 4.02, TPU+25% is 3.21) and B=2 at about 3.7 ms
+(TPU+25% is 4.08).
+
 \* B=1 doesn't use the PLANS path; 5.38 vs 5.50 is restart-to-restart noise.
