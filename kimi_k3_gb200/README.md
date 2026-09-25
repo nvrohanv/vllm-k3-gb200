@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **149.2 (6.701 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **256.9 (7.787 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **425.8 (9.395 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **725.9 (11.020 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **156.2 (6.404 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **268.7 (7.444 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **434.5 (9.207 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **739.2 (10.822 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -36,8 +36,16 @@ source files are edited; the patches are installed at plugin registration.
   - `K3OPT_KDASPLIT=1` (`csrc/kda_split.cu`): KDA decode with the value dimension split over a
     thread-block cluster (8 CTAs per head at M=1), with state prefetched before `griddepcontrol.wait`
     and bit-identical results. ~8.4 → ~2 µs at M=1, ~8.6 → ~3.1 µs at M=8, on 69 layers.
-  - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`, being validated): two fused cluster kernels for
-    the MLA decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate).
+  - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`): two fused cluster kernels replace 8 in the MLA
+    decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate). The dispatch is
+    decided inside an eager-break function, so it is correct under breakable piecewise graphs.
+  - `K3OPT_L2PF=1` (`csrc/l2pf.cu`, `l2pf_patch.py`): right after each layer's routed-expert FC2, a
+    side-stream kernel bulk-prefetches the next layer's attention weights (~55 MB) into L2, so the
+    next in_proj / fused_a / o_proj read from L2 instead of HBM. The stream joins at the end of the
+    forward.
+  - `K3OPT_GEMV=1` (`csrc/k3gemv.cu`, `gemv_patch.py`): PDL weight-prefetch GEMV for cuBLAS-fallback
+    cells at M=3..8. **Not used**: in the model it costs +0.58 ms at B=8, probably because it
+    competes for SMs with the concurrent routed-MoE stream.
   - Experimental and not a win: `K3OPT_ROUTE`, `K3OPT_ARRES` (`csrc/ar_attn_res.cu`).
 - `deploy/`: `serve.sh` plus the server args and env used, and `exps/*.env` flag sets
   (`best.env` = current best). Restart-to-restart noise is about ±2%.
@@ -58,3 +66,4 @@ source files are edited; the patches are installed at plugin registration.
 | + TAILATTN | 7.394 | 11.441 |
 | + MOEFUSED (M ≤ 2) | 6.989 | 11.390 |
 | + KDASPLIT | 6.701 | 11.020 |
+| + MLA + L2PF (`combo5g`) | 6.404 | 10.822 |
