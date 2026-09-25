@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **183.3 (5.454 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **332.8 (6.009 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **551.2 (7.257 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **891.8 (8.970 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **186.2 (5.370 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **339.2 (5.896 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **561.6 (7.123 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **901.9 (8.870 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -111,6 +111,7 @@ source files are edited; the patches are installed at plugin registration.
 | + PLANS (split-K GEMM, M = 3..16) | 5.50* | 9.873 |
 | + MOEBLOCK up to M = 4, tensor-core MoE (moe8) for M = 5..8 | 5.53 | 9.072 (B=4 7.772) |
 | + moe8 FC1/FC2 inside the MoE block for M = 2..4 (`moe8c`) | 5.511 | 9.068 (B=4 7.346) |
-| + distributed sampling / NVLS logits gather (`stepB`) | **5.454** | **8.970** (B=4 **7.257**) |
+| + distributed sampling / NVLS logits gather (`stepB`) | 5.454 | 8.970 (B=4 7.257) |
+| + faster k3mla (early PDL release, bulk loads, fewer cluster syncs) + split o_proj on MLA layers (`mla2`) | **5.370** | **8.870** (B=4 **7.123**) |
 
 \* B=1 doesn't use the PLANS path; 5.38 vs 5.50 is restart-to-restart noise.

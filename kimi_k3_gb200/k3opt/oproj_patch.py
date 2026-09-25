@@ -39,6 +39,9 @@ Env (read at call time unless noted):
   K3OPROJ_MAX_M=16         largest batch that takes the k3oproj path (<= 16; read at patch time)
   K3OPROJ_FUSED_MIN_M=2    single fused kernel for FUSED_MIN_M <= M <= FUSED_MAX_M, else produce +
   K3OPROJ_FUSED_MAX_M=8    consume (capped by k3oproj.fused_max_m(), the co-residency limit)
+  K3OPROJ_MLA_FUSED_MIN_M=5  the same threshold for MLA layers (2026-09-25: with k3mla.attn_out
+                           triggering its dependents early for B <= 4, produce + consume is 1-2 us
+                           faster than the fused kernel at M = 2..4 in the MLA layer chain)
   K3OPROJ_MLA_GATE=1       fold MLA's output gate into the producer (read at patch time)
 """
 
@@ -134,8 +137,11 @@ def install_local_mailbox_for_tests(max_m: int = 16) -> torch.Tensor:
 # --------------------------------------------------------------------------------------------
 # The opaque custom op: every size / eligibility branch lives inside it.
 # --------------------------------------------------------------------------------------------
-def _k3_paths(M: int) -> Optional[str]:
-    fmin = int(os.environ.get("K3OPROJ_FUSED_MIN_M", "2"))
+def _k3_paths(M: int, mla: bool = False) -> Optional[str]:
+    if mla:  # MLA layers: k3mla.attn_out triggers its dependents early for B <= 4 -> produce+consume wins
+        fmin = int(os.environ.get("K3OPROJ_MLA_FUSED_MIN_M", "5"))
+    else:
+        fmin = int(os.environ.get("K3OPROJ_FUSED_MIN_M", "2"))
     fmax = min(int(os.environ.get("K3OPROJ_FUSED_MAX_M", "8")), int(torch.ops.k3oproj.fused_max_m()))
     return "fused" if fmin <= M <= fmax else "split"
 
@@ -183,13 +189,15 @@ def _post_attn_op(
     buf: int,
     eps: float,
     output_norm_eps: float,
+    mla: bool = False,
 ) -> torch.Tensor:
-    """out = AttnRes(prefix (+)= all_reduce(o_proj(x [* sigmoid(gate)])), blocks, ...) (post-attention)."""
+    """out = AttnRes(prefix (+)= all_reduce(o_proj(x [* sigmoid(gate)])), blocks, ...) (post-attention).
+    mla: the layer is an MLA layer (only selects the fused / produce+consume dispatch threshold)."""
     M = x.shape[0]
     out = torch.empty((M, HIDDEN), dtype=torch.bfloat16, device=x.device)
     if _kernel_ok(x, gate, weight, prefix, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks):
         mb, mc, mode, rank = _STATE["mailbox"], _STATE["mc"], _STATE["mode"], _STATE["rank"]
-        if _k3_paths(M) == "fused":
+        if _k3_paths(M, mla) == "fused":
             torch.ops.k3oproj.fused(x, weight, gate, mb, mc, buf, rank, mode, prefix, has_delta, blocks,
                                     norm_weight, qk_weight, output_norm_weight, out, num_blocks, eps,
                                     output_norm_eps, None)
@@ -227,7 +235,7 @@ def _post_attn_op(
 
 @_post_attn_op.register_fake
 def _(x, gate, weight, prefix, has_delta, blocks, norm_weight, qk_weight, output_norm_weight, num_blocks, buf,
-      eps, output_norm_eps):
+      eps, output_norm_eps, mla=False):
     return x.new_empty((x.shape[0], HIDDEN))
 
 
@@ -296,6 +304,7 @@ def install_on_layer(layer) -> bool:
         return False
     _wrap_o_proj(layer, o_proj)
     layer._k3oproj = True
+    layer._k3oproj_mla = isinstance(attn, MultiHeadLatentAttention)
     return True
 
 
@@ -327,6 +336,7 @@ def _post_attn_norm(self, hidden_states, residual, prefix_sum):
         self.layer_idx % NBUF,
         self.mlp_res_norm.variance_epsilon,
         self.post_attention_layernorm.variance_epsilon,
+        bool(getattr(self, "_k3oproj_mla", False)),
     )
     return out, prefix_buf, residual
 
