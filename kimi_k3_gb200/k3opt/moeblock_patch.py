@@ -55,9 +55,12 @@ def _grid() -> int:
     return int(os.environ.get("K3MOEBLOCK_GRID", "0"))
 
 
-def _moe8_enabled() -> bool:
-    return os.environ.get("K3MOEBLOCK_MOE8", "0") == "1" and hasattr(torch.ops, "k3moe8") \
-        and hasattr(torch.ops.k3moe8, "moe_fused_unfinalized")
+def _moe8_enabled(m: int) -> bool:
+    # K3MOEBLOCK_MOE8_MIN_M: at M=1 the extra kernel boundary (routing-only block kernel +
+    # separate tcgen05 kernel) outweighs the FC speedup, so keep the fused CUDA-core block there.
+    return (os.environ.get("K3MOEBLOCK_MOE8", "0") == "1"
+            and m >= int(os.environ.get("K3MOEBLOCK_MOE8_MIN_M", "1"))
+            and hasattr(torch.ops, "k3moe8") and hasattr(torch.ops.k3moe8, "moe_fused_unfinalized"))
 
 
 def _moe8_workspace(dev) -> torch.Tensor:
@@ -214,7 +217,7 @@ def _forward_small(moe, s, hidden_states):
     gemm2 = torch.empty(m * _TOPK, _LAT, dtype=torch.bfloat16, device=dev)
     shared_out = torch.empty(m, _H, dtype=torch.bfloat16, device=dev)
     workspace = torch.empty(m * _TOPK * 192, dtype=torch.float16, device=dev)
-    if _moe8_enabled():
+    if _moe8_enabled(m):
         # Routing-only block kernel (top-k, shared expert, latent hand-off + mailbox re-arm),
         # then the tcgen05 MXFP4 MoE (agents/moe8) for FC1/FC2.
         latent = torch.empty(m, _LAT, dtype=torch.bfloat16, device=dev)

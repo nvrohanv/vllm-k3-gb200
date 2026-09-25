@@ -8,6 +8,11 @@ while IFS='=' read -r key value; do
   [[ -z "${key}" || "${key}" == \#* ]] && continue
   export "${key}=${value}"
 done < ${CFG}/env.txt
+# Installed-package hygiene: these pods persist across experiments, so undo/apply the only
+# vLLM source edit we use (early PDL trigger in the MoE-tail producers) per the config, then
+# verify everything else is pristine against pip's RECORD hashes.
+if [[ "${K3OPT_PTRIGGER:-0}" == "1" ]]; then bash ${CFG}/ptrigger.sh; else bash ${CFG}/ptrigger.sh --revert; fi
+python3 ${CFG}/verify_pristine.py
 # Snapshot weight loader plugin (--load-format k3snap).
 for plugin in k3snap k3opt; do
   if [[ -f "${CFG}/${plugin}.py" ]]; then
@@ -25,7 +30,7 @@ if [[ -f ${CFG}/k3opt_build.py ]]; then
   # A build killed mid-way leaves torch's file lock behind and every later
   # build waits on it forever; this is the only builder in the pod.
   rm -f "${TORCH_EXTENSIONS_DIR:-/root/.cache/torch_extensions}"/*/*/lock
-  if env | grep -qE '^K3OPT_(KDA6|ATTN_RES|MOEFUSED|ARRES|TAILATTN|MLA|L2PF|GEMV|KDASPLIT|KDAFB|OPROJ|MOEBLOCK|MOE8)=1'; then
+  if env | grep -qE '^K3OPT_(KDA6|ATTN_RES|MOEFUSED|ARRES|TAILATTN|MLA|L2PF|GEMV|KDASPLIT|KDAFB|OPROJ|MOEBLOCK|MOE8|STEP)=1'; then
     K3OPT_SRC=/tmp/k3opt/csrc python3 /tmp/k3opt/build.py 2>&1 | tail -2
   fi
 fi

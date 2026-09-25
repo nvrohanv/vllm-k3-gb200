@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **181.7 (5.505 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **331.7 (6.030 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **514.7 (7.772 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **881.8 (9.072 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **181.5 (5.511 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **329.3 (6.074 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **544.5 (7.346 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **882.2 (9.068 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -61,7 +61,10 @@ source files are edited; the patches are installed at plugin registration.
     - reads TRT-LLM's shuffled layout in place.
     Standalone it takes 12.2 / 14.5 / 19.4 / 30.2 µs at M = 1 / 2 / 4 / 8, against TRT-LLM's quant +
     routing + FC1 + FC2 at 17.9 / 21.3 / 31.1 / 55.0 µs. Used for M = 5..8 through the fused-MoE path;
-    top-k runs in the router branch.
+    top-k runs in the router branch. With `K3MOEBLOCK_MOE8=1 K3MOEBLOCK_MOE8_MIN_M=2` it also
+    replaces the CUDA-core FC1/FC2 inside the M ≤ 4 MoE block. The block kernel then runs in
+    routing-only mode: top-k, shared expert, latent hand-off. At M=1 the extra kernel boundary
+    costs more than the FC gain, so M=1 keeps the fused CUDA-core block.
   - `K3OPT_MLA=1` (`csrc/k3mla.cu`, `mla_patch.py`): two fused cluster kernels replace 8 in the MLA
     decode chain (q-prep + cache insert; split-KV attention + combine + W_UV + gate). The dispatch is
     decided inside an eager-break function, so it is correct under breakable piecewise graphs.
@@ -73,6 +76,10 @@ source files are edited; the patches are installed at plugin registration.
     cells at M=3..8. **Not used**: in the model it costs +0.58 ms at B=8, probably because it
     competes for SMs with the concurrent routed-MoE stream.
   - Experimental and not a win: `K3OPT_ROUTE`, `K3OPT_ARRES` (`csrc/ar_attn_res.cu`).
+- `k3opt/ptrigger.sh` (`K3OPT_PTRIGGER=1`): the only edit to vLLM source. It moves the early PDL
+  `launch_dependents` into the two MoE-tail producer kernels. At startup `serve.sh` applies or
+  reverts it according to the flag, then `verify_pristine.py` checks the installed vLLM/FlashInfer
+  against pip RECORD hashes.
 - `deploy/`: `serve.sh` plus the server args and env used, and `exps/*.env` flag sets
   (`best.env` = current best). Restart-to-restart noise is about ±2%.
 - `bench/`: `bench.sh` (mirrors the TPU harness: `vllm bench serve`, random 1/1024,
@@ -97,6 +104,7 @@ source files are edited; the patches are installed at plugin registration.
 | + OPROJ (fused o_proj + NVLS all-reduce + AttnRes) | 5.769 | 10.155 |
 | + MOEBLOCK (M ≤ 2) | 5.383 | 10.159 |
 | + PLANS (split-K GEMM, M = 3..16) | 5.50* | 9.873 |
-| + MOEBLOCK up to M = 4, tensor-core MoE (moe8) for M = 5..8 | 5.53 | **9.072** (B=4 7.772) |
+| + MOEBLOCK up to M = 4, tensor-core MoE (moe8) for M = 5..8 | 5.53 | 9.072 (B=4 7.772) |
+| + moe8 FC1/FC2 inside the MoE block for M = 2..4 (`moe8c`) | 5.511 | **9.068** (B=4 **7.346**) |
 
 \* B=1 doesn't use the PLANS path; 5.38 vs 5.50 is restart-to-restart noise.

@@ -523,6 +523,9 @@ def register():
     if _flag("K3OPT_PLANS"):
         from plans_patch import patch_plans
         patch_plans()
+    if _flag("K3OPT_STEP"):
+        from step_patch import patch_step
+        patch_step(_load_ext)
     if _flag("K3OPT_GEMV"):
         from gemv_patch import patch_gemv
         patch_gemv(_load_ext)
