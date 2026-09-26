@@ -49,6 +49,9 @@ PF_MODE = os.environ.get("K3AF_PF", "keep")
 # K3AF_POLL = mode + 10 * backoff (units of 32 ns): 0 = full-slice polling (default), 1 = watch one word per source
 # rank first (less L2 pressure on the lines the NVLS stores land in), e.g. 31 = mode 1 with 96 ns backoff.
 POLL = int(os.environ.get("K3AF_POLL", "0"))
+# K3AF_EF (l2pf 2026-09-26, default 1): stage the in_proj with an L2 evict_first cache hint (read-once weights; at
+# evict_normal the 46 MB of dead in_proj lines slow the next MoE by ~2-3 us, RESULTS.md Task 6). 0 = af9aef0f behaviour.
+EF = os.environ.get("K3AF_EF", "1") == "1"
 # K3AF_MLA=1 (default 0, opt-in; kernel tested at N=2880, model path not yet run in a server): also fuse AttnRes +
 # fused_qkv_a_g_proj (2112 qkv_a + 768 gate rows) for the q-LoRA MLA layers with an output gate.
 MLA_ON = os.environ.get("K3AF_MLA", "0") == "1"
@@ -142,7 +145,8 @@ def _attnres_inproj_op(
         y = torch.empty((M, in_proj_weight.shape[0]), dtype=torch.bfloat16, device=delta.device)
         torch.ops.k3sgt.attnres_inproj(
             mailbox, prefix, blocks, norm_weight, qk_weight, output_norm_weight, None, in_proj_weight, y,
-            _sched(key, delta.device), num_blocks, block_write_idx, eps, output_norm_eps, None, _pf_table(key), POLL)
+            _sched(key, delta.device), num_blocks, block_write_idx, eps, output_norm_eps, None, _pf_table(key),
+            POLL + (100000 if EF else 0))
         _STATE["stats"]["fused"] += 1
         return y
     # Today's path: tailattn's consumer (fused Lamport + AttnRes, or copy + vLLM attn_res), then the in_proj module.
@@ -361,7 +365,7 @@ def patch_attnfront(load_ext) -> bool:
         orig_init(self, *args, **kwargs)
         n = _flag_layers(self)
         print(f"[k3af] {n} layers fuse AttnRes + in_proj (KDA{' + MLA' if MLA_ON else ''}, M<={MAX_M}, "
-              f"K3AF_PF={PF_MODE})", flush=True)
+              f"K3AF_PF={PF_MODE}, K3AF_POLL={POLL}, K3AF_EF={int(EF)})", flush=True)
 
     Model.__init__ = __init__
     try:

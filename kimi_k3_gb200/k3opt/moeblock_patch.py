@@ -65,6 +65,17 @@ MoE-tail replacement (experimental, default off; K3MOEBLOCK_TAIL=fused|kernel, T
             off | entry (T1 issues it before polling) | after (T1 issues it after its H4 publish);
             K3T1_PF_ISSUERS / K3T1_PF_CHUNK tune the in-kernel modes.
 
+FRONT4 (agents/oproj/front, 2026-09-26) = agents/moefused/moeblock_patch_t1_maxm.py (07ac686d) + three env knobs; with
+all three unset it behaves exactly like 07ac686d (only the moe_front.cu build must provide the op arguments below):
+  * K3MOEFRONT_PUB=1 (front layers, M <= K3T1_MAX_M; needs K3MOEBLOCK_TAIL=t1, or k3mk): moe_block_front with the T1
+    PUBLISH epilogue (lat_mb[par3][rank] multicast + rs_mb shards, one warp per 128-B line: T1_INTERFACE.md v3 C.1),
+    then k3t1.tail (resp. k3mk.tail) in publish mode (no gemm2 / wts / shared_out, no griddepcontrol.wait).
+  * K3MOEFRONT_RO_MIN_M=m0 (0 = off): for m0 <= M <= K3MOEFRONT_MAX_M the front kernel runs routing-only (router,
+    down-shard, shared expert, latent hand-off into latent_out) and k3moe8 runs FC1/FC2; the tail then is whatever
+    K3MOEBLOCK_TAIL gives the front path (T1 front mode / k3mk / vLLM).
+  * K3MOEFRONT_FLAGS bit 16 (candidate FC1 L2 prefetch in the agents/oproj/front moe_front.cu) is applied at M = 1
+    only (it measured +1.7 us at M = 2 routing-only); bit 64 = BIG contract (<= 188,928 B smem, 544 x 80 regs).
+
 MoE FRONT END (DESIGN_PLAN W1-3 "moefront", agents/oproj/front; K3MOEFRONT=1, default off; TP16, M <= 2):
     Needs agents/oproj/front/moe_front.cu (namespace k3mf) + oproj_front.cu (namespace k3oprojf) built, and
     agents/oproj/front/oproj_patch.py instead of k3opt/oproj_patch.py (its post-attention consume / fused
@@ -199,6 +210,8 @@ def _tail_buffers():
 _FRONT = os.environ.get("K3MOEFRONT", "0") == "1"
 _FRONT_MAX_M = max(0, min(2, int(os.environ.get("K3MOEFRONT_MAX_M", "2"))))
 _FRONT_FLAGS = int(os.environ.get("K3MOEFRONT_FLAGS", "0"))  # bit 0: shared gate_up rows staged after the router
+_FRONT_PUB = os.environ.get("K3MOEFRONT_PUB", "0") == "1"   # FRONT4: T1 PUBLISH epilogue of the front kernel
+_FRONT_RO_MIN_M = int(os.environ.get("K3MOEFRONT_RO_MIN_M", "0"))  # FRONT4: routing-only front + k3moe8 (0: off)
 _FRONT_BUF: dict = {}
 
 
@@ -210,7 +223,9 @@ def front_buffers(dev) -> dict:
         b = dict(xmoe=xmoe, epoch=torch.zeros(256, dtype=torch.int32, device=dev),
                  sc=torch.full((2 * 8 * 2 * _E,), -1, dtype=torch.int64, device=dev),
                  hg=torch.zeros(2 * (2 * 2 * _SH + 2 * _TOPK * 192), dtype=torch.int32, device=dev),
-                 barrier=torch.zeros(8, dtype=torch.int64, device=dev))
+                 barrier=torch.zeros(8, dtype=torch.int64, device=dev),
+                 # FRONT4 publish mode: local line-gather staging [2 tokens][448 octets][16 B], armed (0x80000000)
+                 pst=torch.full((2 * 448 * 4,), -0x80000000, dtype=torch.int32, device=dev))
         _FRONT_BUF[str(dev)] = b
     return b
 
@@ -295,7 +310,7 @@ def _k3mk_buffers():
                          variant=int(os.environ.get("K3MK_TAIL_VARIANT", "14")),
                          # T1: its own readers-done counters (they count modulo its cluster count)
                          t1_cnt=torch.zeros(64, dtype=torch.int64, device=dev),
-                         t1_nc=int(os.environ.get("K3T1_NC", "15")))
+                         t1_nc=int(os.environ.get("K3T1_NC", "14")))
     return _TAIL["k3mk"]
 
 
@@ -738,11 +753,41 @@ def _forward_front(moe, s, x, m, par, num_tokens, hidden):
     gemm2 = torch.empty(m * _TOPK, _LAT, dtype=torch.bfloat16, device=dev)
     shared_out = torch.empty(m, _H, dtype=torch.bfloat16, device=dev)
     workspace = torch.empty(m * _TOPK * 192, dtype=torch.float16, device=dev)
-    torch.ops.k3mf.moe_block_front(
-        fb["xmoe"], fb["epoch"], par, s["gate_w"], s["bias"], s["down_w"], op._mailbox,
-        int(op._mailbox_multicast_ptr), st["rank"], s["sh_w13"], fb["sc"], *s["w"], workspace, fb["barrier"], gemm2,
-        ids, wts, fb["hg"], s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"], s["scale"], 0,
-        s["sh_beta"], s["sh_lbeta"], 0, None, None, _FRONT_FLAGS)
+    tail = s.get("tail")
+    # FRONT4 knobs (all off -> exactly the 07ac686d call below)
+    flags = _FRONT_FLAGS if m == 1 else (_FRONT_FLAGS & ~16)  # bit 16: candidate FC1 L2 prefetch, M = 1 only
+    kb = _TAIL.get("k3mk") if (tail is not None and _TAIL_MODE in ("k3mk", "t1")) else None
+    ro = (_FRONT_RO_MIN_M > 0 and m >= _FRONT_RO_MIN_M and hasattr(torch.ops, "k3moe8")
+          and hasattr(torch.ops.k3moe8, "moe_fused_unfinalized"))
+    t1_ok = _TAIL_MODE == "t1" and m <= _T1_MAX_M
+    pub = _FRONT_PUB and not ro and kb is not None and (t1_ok or _TAIL_MODE == "k3mk")
+    latent = None
+    if ro:  # routing-only front (latent_out) + k3moe8 FC1/FC2 -> unfinalized gemm2 for the tail
+        latent = torch.empty(m, _LAT, dtype=torch.bfloat16, device=dev)
+        e = torch.empty(0, dtype=torch.bfloat16, device=dev)
+        torch.ops.k3mf.moe_block_front(
+            fb["xmoe"], fb["epoch"], par, s["gate_w"], s["bias"], s["down_w"], op._mailbox,
+            int(op._mailbox_multicast_ptr), st["rank"], s["sh_w13"], fb["sc"], *s["w"], workspace, fb["barrier"], e,
+            ids, wts, fb["hg"], s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"], s["scale"], 0,
+            s["sh_beta"], s["sh_lbeta"], 0, None, None, flags, None, 0, None, 0, latent)
+        torch.ops.k3moe8.moe_fused_unfinalized(latent, ids, *s["w"], _moe8_workspace(dev), _barrier(dev), gemm2,
+                                               s["betas"][0], s["betas"][1])
+        _STATE["stats"]["front_ro"] = _STATE["stats"].get("front_ro", 0) + 1
+    elif pub:  # PUBLISH epilogue: lat_mb[par3][rank] (multicast) + rs_mb shards; gemm2 / shared_out not written
+        e = torch.empty(0, dtype=torch.bfloat16, device=dev)
+        torch.ops.k3mf.moe_block_front(
+            fb["xmoe"], fb["epoch"], par, s["gate_w"], s["bias"], s["down_w"], op._mailbox,
+            int(op._mailbox_multicast_ptr), st["rank"], s["sh_w13"], fb["sc"], *s["w"], workspace, fb["barrier"], e,
+            ids, wts, fb["hg"], s["sh_down"], e, s["betas"][0], s["betas"][1], s["renorm"], s["scale"], 0,
+            s["sh_beta"], s["sh_lbeta"], 0, None, None, flags, kb["lat"], kb["lat_mc"], kb["rs_peers"], tail["par3"],
+            None, fb["pst"])
+        _STATE["stats"]["front_pub"] = _STATE["stats"].get("front_pub", 0) + 1
+    else:
+        torch.ops.k3mf.moe_block_front(
+            fb["xmoe"], fb["epoch"], par, s["gate_w"], s["bias"], s["down_w"], op._mailbox,
+            int(op._mailbox_multicast_ptr), st["rank"], s["sh_w13"], fb["sc"], *s["w"], workspace, fb["barrier"],
+            gemm2, ids, wts, fb["hg"], s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"],
+            s["scale"], 0, s["sh_beta"], s["sh_lbeta"], 0, None, None, flags)
     if os.environ.get("K3MOEFRONT_CHECK", "0") == "1" and not torch.cuda.is_current_stream_capturing():
         # debug (eager only): the x_moe the kernel read == the MoE input
         torch.cuda.synchronize()
@@ -752,13 +797,20 @@ def _forward_front(moe, s, x, m, par, num_tokens, hidden):
             raise RuntimeError(f"K3MOEFRONT: x_moe published for layer {getattr(moe, 'layer_idx', '?')} != MoE input")
     _STATE["stats"]["front"] = _STATE["stats"].get("front", 0) + 1
     runner = s["runner"]
-    tail = s.get("tail")
     if tail is not None and _TAIL_MODE == "t1" and _TAIL.get("k3mk") and m <= _T1_MAX_M:
-        # T1 FRONT mode on the front kernel's gemm2 / wts / shared_out (until moe_front has the publish epilogue,
-        # agents/moefused/T1_INTERFACE.md); K3T1_PF decides fork / in-kernel / off for the next-layer prefetch
+        # T1 FRONT mode on the front kernel's gemm2 / wts / shared_out, or (FRONT4 K3MOEFRONT_PUB) T1 PUBLISH mode on
+        # the front kernel's epilogue; K3T1_PF decides fork / in-kernel / off for the next-layer prefetch
         pf = _t1_prefetch(runner, m)
-        _t1_tail(_TAIL["k3mk"], tail, m, (gemm2, wts, shared_out), pf)
-        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace]
+        _t1_tail(_TAIL["k3mk"], tail, m, None if pub else (gemm2, wts, shared_out), pf)
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace, latent]
+        return _tail_result(runner, tail, m).view(num_tokens, hidden)
+    if pub:  # FRONT4: k3mk.tail PUBLISH mode (K3MOEBLOCK_TAIL=k3mk + K3MOEFRONT_PUB)
+        _l2pf_fork(runner, m)
+        torch.ops.k3mk.tail(kb["lat"], kb["rs"], tail["par3"], tail["w_up"], tail["gamma"], tail["eps"], tail["mb"],
+                            tail["mb_mc"], kb["epoch"], kb["rank"], m, None, None, None, None, 0, None, True,
+                            kb["variant"])
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace, latent]
+        _STATE["stats"]["tail_k3mk_pub"] = _STATE["stats"].get("tail_k3mk_pub", 0) + 1
         return _tail_result(runner, tail, m).view(num_tokens, hidden)
     k3mk_tail = tail is not None and _TAIL_MODE == "k3mk" and bool(_TAIL.get("k3mk"))
     pf_mode = _k3mk_pf_mode() if k3mk_tail else "before"
@@ -772,7 +824,7 @@ def _forward_front(moe, s, x, m, par, num_tokens, hidden):
                             kb["rs_peers"], True, kb["variant"])
         if pf_mode == "after":
             _l2pf_fork(runner, m)
-        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace]
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace, latent]
         _STATE["stats"]["tail_k3mk"] = _STATE["stats"].get("tail_k3mk", 0) + 1
         return _tail_result(runner, tail, m).view(num_tokens, hidden)
     if tail is not None and _TAIL_MODE == "kernel":
@@ -780,13 +832,15 @@ def _forward_front(moe, s, x, m, par, num_tokens, hidden):
         torch.ops.k3moe.moe_tail(gemm2, wts, shared_out, tail["w_up"], tail["gamma"], tb["lat"], tb["lat_mc"],
                                  tb["rs"], tb["rs_peers"], tail["mb"], tail["mb_mc"], tb["counter"], tail["eps"],
                                  tb["rank"], tb.get("multicast", True))
-        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace]
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace, latent]
         return _tail_result(runner, tail, m).view(num_tokens, hidden)
     ident = s["ident"].get(m)
     if ident is None:
         ident = torch.arange(m * _TOPK, dtype=torch.int32, device=dev).view(m, _TOPK)
         s["ident"][m] = ident
     fused = UnfinalizedMoEOutput(gemm2_permuted=gemm2, expert_weights=wts, expanded_idx_to_permuted_idx=ident)
+    if latent is not None:
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace, latent]
     result = runner._small_batch_tail(fused, shared_out, None)
     result = runner._maybe_add_zero_expert_output(result)
     return result.view(num_tokens, hidden)
@@ -883,6 +937,9 @@ def patch_moeblock(load_ext) -> None:
             print(f"[k3opt] K3MOEFRONT: routing-first MoE front end (k3mf.moe_block_front) for M<={_FRONT_MAX_M} "
                   f"(flags={_FRONT_FLAGS}, tail: {_TAIL_MODE or 'vLLM'}); needs agents/oproj/front/oproj_patch.py",
                   flush=True)
+            if _FRONT_PUB or _FRONT_RO_MIN_M:
+                print(f"[k3opt] K3MOEFRONT (front4): publish epilogue {int(_FRONT_PUB)} (tail {_TAIL_MODE or 'vLLM'}, "
+                      f"M <= {_T1_MAX_M}), routing-only + k3moe8 for M >= {_FRONT_RO_MIN_M or 'off'}", flush=True)
         else:
             print(f"[k3opt] K3MOEFRONT: NOT enabled (needs k3mf.moe_block_front built, 1 <= K3MOEFRONT_MAX_M <= "
                   f"K3MOEBLOCK_MAX_M, K3MOEBLOCK_TAIL != fused)", flush=True)

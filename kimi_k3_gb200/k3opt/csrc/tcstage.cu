@@ -51,6 +51,7 @@ struct Params {
   unsigned long long* tl;        // optional [grid][16] timeline
   float* dbg;                    // optional [grid][216][8] partials (local row, token)
   int N, sm_m, sm_box, r_bytes, c_off, b_off, i_off, bar_off, detect, poll_ns, poll_mode, dbgf;
+  int ef;  // 1: in_proj weight TMA with .L2::cache_hint evict_first (read-once stream; op arg poll += 100000)
   int t_row0[NCL], s_row0[NCL], s_rows[NCL], c_row0[NCL], c_rows[NCL];
   int mv;  // valid tokens (<= M); rows >= mv of x are zero and their outputs are not stored
   // AttnRes front (attnres_inproj only)
@@ -229,12 +230,25 @@ __device__ __forceinline__ void wait_bar(uint32_t bar, uint32_t parity) {
 __device__ __forceinline__ void expect_tx(uint32_t bar, uint32_t bytes) {
   asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(bar), "r"(bytes) : "memory");
 }
-__device__ __forceinline__ void tma3(uint32_t dst, const CUtensorMap* map, uint32_t bar, int c0, int c1, int c2) {
-  asm volatile(
-      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5}], "
-      "[%2];" ::"r"(dst),
-      "l"(map), "r"(bar), "r"(c0), "r"(c1), "r"(c2)
-      : "memory");
+// ef (l2pf 2026-09-26): the staged in_proj is read once per layer; at evict_normal its 46 MB of dead lines slow
+// the next MoE by ~2-3 us (RESULTS.md Task 6); ef = 1 loads it with an L2 evict_first cache hint instead.
+__device__ __forceinline__ void tma3(uint32_t dst, const CUtensorMap* map, uint32_t bar, int c0, int c1, int c2,
+                                     int ef = 0) {
+  if (ef) {
+    uint64_t pol;
+    asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint [%0], "
+        "[%1, {%3, %4, %5}], [%2], %6;" ::"r"(dst),
+        "l"(map), "r"(bar), "r"(c0), "r"(c1), "r"(c2), "l"(pol)
+        : "memory");
+  } else {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5}], "
+        "[%2];" ::"r"(dst),
+        "l"(map), "r"(bar), "r"(c0), "r"(c1), "r"(c2)
+        : "memory");
+  }
 }
 __device__ __forceinline__ void bulk(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst),
@@ -1061,7 +1075,7 @@ __global__ void __cluster_dims__(CL, 1, 1) __maxnreg__(K3SGT_MAXNREG)
         const int s = q % RING;
         if (q >= RING) wait_bar(empty0 + 8 * s, ((q / RING) - 1) & 1);
         expect_tx(full0 + 8 * s, SLOTB);
-        tma3(R + s * SLOTB, &map_t, full0 + 8 * s, 0, t_row0, j * KCH + 2 * q);
+        tma3(R + s * SLOTB, &map_t, full0 + 8 * s, 0, t_row0, j * KCH + 2 * q, p.ef);
       }
       if (p.sm_m) {
         wait_bar(tmem_ready, 0);  // ring free
@@ -1069,7 +1083,7 @@ __global__ void __cluster_dims__(CL, 1, 1) __maxnreg__(K3SGT_MAXNREG)
         const uint32_t hb = 7 * p.sm_box * 128;
         for (int h = 0; h < 2; ++h) {
           expect_tx(sfull0 + 8 * h, hb);
-          tma3(R + h * hb, &map_s, sfull0 + 8 * h, 0, s_row0, j * KCH + 7 * h);
+          tma3(R + h * hb, &map_s, sfull0 + 8 * h, 0, s_row0, j * KCH + 7 * h, p.ef);
         }
         if (tl || p.pf_n) {  // staging complete (this warp never polls, so waiting here is free)
           wait_bar(sfull0 + 8, 0);
@@ -1324,6 +1338,7 @@ void stage_gemv(torch::Tensor mailbox, torch::Tensor w, torch::Tensor y, torch::
   p.detect = (cfgi / 10) % 10;
   p.poll_mode = (cfgi / 100) % 10;
   p.poll_ns = (int)((cfgi / 1000) % 100) * 32;
+  p.ef = 0;
   p.dbgf = (int)(cfgi / 100000);  // timing only: bit 0 skip TMEM MMAs, 1 skip smem MMAs, 3 skip CUDA-core share
   if (tl) TORCH_CHECK(tl->numel() >= CL * NCL * 32, "tl needs [120][32] int64");
   const int smem = plan(p, N, cfg, false);
@@ -1395,6 +1410,7 @@ void attnres_inproj(torch::Tensor mailbox, torch::Tensor prefix, torch::Tensor b
   // source-rank segment (low L2 pressure while the NVLS stores land), backoff in units of 32 ns between rounds
   p.poll_mode = (int)(poll % 10);
   p.poll_ns = (int)((poll / 10) % 100) * 32;
+  p.ef = (int)((poll / 100000) % 10);  // poll += 100000: in_proj TMA with L2 evict_first (K3AF_EF)
   if (pf_ranges && pf_ranges->numel()) {
     TORCH_CHECK(pf_ranges->is_cuda() && pf_ranges->scalar_type() == at::kLong && pf_ranges->is_contiguous() &&
                 pf_ranges->numel() % 2 == 0, "pf_ranges: int64 CUDA [n, 2] (ptr, bytes)");
