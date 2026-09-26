@@ -2,6 +2,15 @@
 //
 //   torch.ops.k3pf.prefetch_l2(Tensor ranges, int n) -> ()
 //   torch.ops.k3pf.prefetch_l2_cfg(Tensor ranges, int n, int grid, int chunk, int policy, int pdl) -> ()
+//   torch.ops.k3pf.prefetch_l2_ex(Tensor ranges, int n, int grid, int chunk, int policy, int pdl, int carveout,
+//                                 int priority) -> ()
+//     (l2pf 2026-09-26, K3PF_MOE): like prefetch_l2_cfg plus two PER-LAUNCH attributes (graph-capturable):
+//     * carveout >= 0: cudaLaunchAttributePreferredSharedMemoryCarveout (-1 = none), so the zero-smem CTAs never
+//       leave a small-carveout SM in front of a ~190-200 KB-smem CTA, without touching the attention prefetch's
+//       function-level carveout;
+//     * priority = 1: cudaLaunchAttributePriority = the device's greatest stream priority (0 = none). The CTA
+//       dispatcher serves pending grids by priority, so the prefetch is not queued behind the undispatched CTAs
+//       of a big PDL-launched grid (route_shared: 152 x 190 KB, only ~40 fit while the fused o_proj runs).
 //
 // `ranges` is a device int64 tensor holding n (ptr, bytes) pairs (row-major [n, 2] or flat [2n]),
 // built once at init. Because the kernel reads the table from device memory, the launch has
@@ -129,7 +138,8 @@ __global__ void __launch_bounds__(kThreads) k3pf_tmaload_kernel(const int64_t* _
   for (int64_t j = (k > kSlots ? k - kSlots : 0); j < k; ++j) wait(j);  // never exit with copies in flight
 }
 
-void launch_prefetch(const at::Tensor& ranges, int64_t n, int64_t grid, int64_t chunk, int64_t policy, bool pdl) {
+void launch_prefetch(const at::Tensor& ranges, int64_t n, int64_t grid, int64_t chunk, int64_t policy, bool pdl,
+                     int64_t launch_carveout = -1, int64_t launch_priority = 0) {
   TORCH_CHECK(ranges.is_cuda(), "k3pf: ranges must be a CUDA tensor");
   TORCH_CHECK(ranges.scalar_type() == at::kLong, "k3pf: ranges must be int64");
   TORCH_CHECK(ranges.is_contiguous(), "k3pf: ranges must be contiguous");
@@ -162,11 +172,31 @@ void launch_prefetch(const at::Tensor& ranges, int64_t n, int64_t grid, int64_t 
   cfg.blockDim = dim3(kThreads);
   cfg.dynamicSmemBytes = 0;
   cfg.stream = c10::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
-  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchAttribute attr[3];
+  int na = 0;
+  if (pdl) {
+    attr[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[na].val.programmaticStreamSerializationAllowed = 1;
+    ++na;
+  }
+  if (launch_carveout >= 0) {
+    TORCH_CHECK(launch_carveout <= 100, "k3pf: carveout must be in [0, 100] or -1");
+    attr[na].id = cudaLaunchAttributePreferredSharedMemoryCarveout;
+    attr[na].val.sharedMemCarveout = (unsigned int)launch_carveout;
+    ++na;
+  }
+  if (launch_priority != 0) {
+    static const int greatest = [] {
+      int lo = 0, hi = 0;
+      C10_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+      return hi;  // numerically lowest = highest priority
+    }();
+    attr[na].id = cudaLaunchAttributePriority;
+    attr[na].val.priority = greatest;
+    ++na;
+  }
   cfg.attrs = attr;
-  cfg.numAttrs = pdl ? 1 : 0;
+  cfg.numAttrs = na;
   if (policy == 4) {
     static bool smem_attr_set = false;
     if (!smem_attr_set) {
@@ -190,14 +220,22 @@ void prefetch_l2_cfg(const at::Tensor& ranges, int64_t n, int64_t grid, int64_t 
   launch_prefetch(ranges, n, grid, chunk, policy, pdl != 0);
 }
 
+void prefetch_l2_ex(const at::Tensor& ranges, int64_t n, int64_t grid, int64_t chunk, int64_t policy, int64_t pdl,
+                    int64_t carveout, int64_t priority) {
+  launch_prefetch(ranges, n, grid, chunk, policy, pdl != 0, carveout, priority);
+}
+
 }  // namespace
 
 TORCH_LIBRARY(k3pf, m) {
   m.def("prefetch_l2(Tensor ranges, int n) -> ()");
   m.def("prefetch_l2_cfg(Tensor ranges, int n, int grid, int chunk, int policy, int pdl) -> ()");
+  m.def("prefetch_l2_ex(Tensor ranges, int n, int grid, int chunk, int policy, int pdl, int carveout, "
+        "int priority) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(k3pf, CUDA, m) {
   m.impl("prefetch_l2", &prefetch_l2);
   m.impl("prefetch_l2_cfg", &prefetch_l2_cfg);
+  m.impl("prefetch_l2_ex", &prefetch_l2_ex);
 }

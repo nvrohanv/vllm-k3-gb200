@@ -45,11 +45,19 @@ Issue point K3PF_MOE_AT:
          the down-shard GEMV, and off in_proj (where the attention prefetch's value is: in-server B2 profile)
   attn   appended after the attention prefetch in the post-FC2 fork (prefetches the NEXT layer's MoE weights;
          runs on top of that layer's in_proj -- measured worse)
-1-GPU chain (agents/l2pf/RESULTS.md "K3PF_MOE"): "down" at the o_proj point -0.3..-1.0 us/layer (M = 2..4, KDA and
-MLA); "sdown" adds nothing, "router"/"shared" cost (they compete with route_shared's own staging), so opt-in only.
+Launch: grid K3PF_MOE_GRID (8), with the per-launch attributes K3PF_MOE_PRIO=1 (greatest priority) and
+K3PF_MOE_CARVEOUT=100 through k3pf.prefetch_l2_ex (pfmoe/csrc/l2pf.cu; falls back to a plain launch with an older
+l2pf.cu). Why: the fork's event completes with the attention core, ~0.1 us after route_shared (152 CTAs x 190 KB)
+is PDL-launched behind the fused o_proj (112 SMs); a plain-priority prefetch is dispatched only after all of
+route_shared's CTAs are, i.e. when the fused o_proj exits -- on top of the down-shard GEMV it should front-run and
+into the routing-only block's launch (in-server v1 of this patch: B2 +0.045 ms, B4 -0.076 ms).
+1-GPU chain, in-server-exact fork layout (agents/l2pf/RESULTS.md "K3PF_MOE"): plain launch KDA M=2 +0.13..+0.53,
+MLA M=2 +0.30 us/layer (in-server B2 loss reproduced), M=3/4 -0.5..-1.2; with priority + carveout 100 + grid 8:
+KDA M=2 -0.24..-0.38, MLA M=2 -0.07, KDA M=3 -1.2, M=4 -0.76, MLA M=4 -0.84.
+"sdown" adds nothing, "router"/"shared" cost (they compete with route_shared's own staging), so opt-in only.
 Knobs: K3PF_MOE_W (comma set, table order = the given order; default "down"), K3PF_MOE_AT (oproj | attn),
-K3PF_MOE_MIN_M / K3PF_MOE_MAX_M (default 2..4; M = 1 would overlap the front kernel's pre-wait staging),
-K3PF_MOE_GRID (default K3PF_GRID). The attention fork is unchanged. The tables are built with the attention ones
+K3PF_MOE_MIN_M / K3PF_MOE_MAX_M (default 2..4; M = 1 would overlap the front kernel's pre-wait staging; M >= 5 runs
+vLLM's MoE path: untested), K3PF_MOE_GRID (8), K3PF_MOE_PRIO (1), K3PF_MOE_CARVEOUT (100). The attention fork is unchanged. The tables are built with the attention ones
 (lazily, at the first eligible eager MoE), so K3PF_MOE is inactive wherever the attention fork never runs
 (K3PF_DISABLE=1, K3T1_PF=off); with K3PF_MOE_AT=attn it is also skipped wherever launch_after_moe is skipped.
 
@@ -107,7 +115,13 @@ PDL = int(os.environ.get("K3PF_PDL", "0"))
 GRID = int(os.environ.get("K3PF_GRID", "64" if MODE == "tma" else "32"))
 CHUNK = int(os.environ.get("K3PF_CHUNK", "32768" if MODE == "tma" else "16384"))
 POLICY = 4 if MODE == "tma" else int(os.environ.get("K3PF_POLICY", "0"))
-MOE_GRID = int(os.environ.get("K3PF_MOE_GRID", str(GRID)))
+MOE_GRID = int(os.environ.get("K3PF_MOE_GRID", "8"))
+# Per-launch attributes of the MoE prefetch (need k3pf.prefetch_l2_ex, pfmoe/csrc/l2pf.cu; else plain launch):
+# K3PF_MOE_PRIO=1: greatest launch priority, so the CTA dispatcher does not queue it behind route_shared's
+# undispatched CTAs (152 x 190 KB, PDL-launched while the fused o_proj holds 112 SMs); K3PF_MOE_CARVEOUT=100: max
+# shared carveout, so its CTAs never leave a small-carveout SM in front of a ~190 KB CTA. PRIO 0 / CARVEOUT -1 = off.
+MOE_PRIO = int(os.environ.get("K3PF_MOE_PRIO", "1"))
+MOE_CARVEOUT = int(os.environ.get("K3PF_MOE_CARVEOUT", "100"))
 
 
 def _enabled() -> bool:
@@ -211,6 +225,18 @@ def ms_dev(layer) -> torch.device:
     return ts[0].device if ts else torch.device("cuda")
 
 
+def _moe_ex() -> bool:
+    return bool((MOE_PRIO or MOE_CARVEOUT >= 0) and hasattr(torch.ops.k3pf, "prefetch_l2_ex"))
+
+
+def _launch_moe(rng, n) -> None:
+    if _moe_ex():
+        torch.ops.k3pf.prefetch_l2_ex(rng, n, MOE_GRID, CHUNK, 0, 0, MOE_CARVEOUT, 1 if MOE_PRIO else 0)
+        _STATE["stats"]["moe_ex"] = _STATE["stats"].get("moe_ex", 0) + 1
+    else:
+        torch.ops.k3pf.prefetch_l2_cfg(rng, n, MOE_GRID, CHUNK, 0, 0)
+
+
 def launch_moe_at_oproj(o_proj, num_tokens: int) -> bool:
     """K3PF_MOE_AT=oproj: fork the side stream at this o_proj call and prefetch this layer's MoE weights."""
     if not (MOE_MIN_M <= num_tokens <= MOE_MAX_M) or num_tokens > MAX_TOKENS:
@@ -234,7 +260,7 @@ def launch_moe_at_oproj(o_proj, num_tokens: int) -> bool:
     s.wait_event(ev)
     _STATE["pending"] = True  # joined with the attention prefetch at the end of the model forward
     with torch.cuda.stream(s):
-        torch.ops.k3pf.prefetch_l2_cfg(me[0], me[1], MOE_GRID, CHUNK, 0, 0)
+        _launch_moe(me[0], me[1])
     _STATE["stats"]["moe_launched"] = _STATE["stats"].get("moe_launched", 0) + 1
     return True
 
@@ -312,8 +338,10 @@ def build_tables(model=None) -> int:
         mb2 = (sum(t[2] for t in moe_tables.values()) / n / 2**20) if n else 0.0
         where = ("the next layer's MoE weights, after the attention prefetch" if MOE_AT == "attn" else
                  "their own MoE weights, forked at the o_proj call")
+        attrs = (f"priority {'max' if MOE_PRIO else 'default'}, carveout {MOE_CARVEOUT}" if _moe_ex() else
+                 "plain launch (k3pf.prefetch_l2_ex not built)")
         print(f"[k3opt] K3PF_MOE: {n} MoE layers prefetch {where} {MOE_SET} "
-              f"(avg {mb2:.1f} MB, M {MOE_MIN_M}..{MOE_MAX_M}, grid {MOE_GRID})", flush=True)
+              f"(avg {mb2:.1f} MB, M {MOE_MIN_M}..{MOE_MAX_M}, grid {MOE_GRID}, {attrs})", flush=True)
     return total
 
 
@@ -370,7 +398,7 @@ def launch_after_moe(runner, num_tokens: int) -> bool:
         if MOE_ON and MOE_AT == "attn" and MOE_MIN_M <= num_tokens <= MOE_MAX_M:
             me = _STATE.get("moe_tables", {}).get(id(runner))
             if me is not None:  # K3PF_MOE: after the attention prefetch, same stream, plain (evict_normal) policy
-                torch.ops.k3pf.prefetch_l2_cfg(me[0], me[1], MOE_GRID, CHUNK, 0, 0)
+                _launch_moe(me[0], me[1])
                 _STATE["stats"]["moe_launched"] = _STATE["stats"].get("moe_launched", 0) + 1
     _STATE["stats"]["launched"] += 1
     return True

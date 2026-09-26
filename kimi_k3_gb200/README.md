@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **218.4 (4.578 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **372.6 (5.368 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **614.0 (6.515 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **982.1 (8.146 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **218.5 (4.577 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **372.5 (5.369 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **612.9 (6.526 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **989.2 (8.087 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -148,7 +148,8 @@ source files are edited; the patches are installed at plugin registration.
 | + K3EF=route,mla + moe8 v12 (DSMEM FC1->FC2 hand-off at M=3..4, 144-CTA grids) (`m8v12`) | 4.839 | 8.144 (B=2 5.437, B=4 6.591) |
 | + T1 v4: every 128-B mailbox line written by a single warp (8 lanes x 16 B) instead of 8 CTAs, which avoids L2 write-behind-poll interlocks; T1 now used at M<=2 (`t1v4m2`) | 4.727 | 8.139 (B=2 5.374, B=4 6.587) |
 | + MoE front v8: ballot-ranked top-16 without same-address smem atomics, branch-free tile loads, deterministic FC1 reduction, evict_first weight TMAs, BIG-contract footprint, line-coalesced publish path (`f4g`) | **4.578** | 8.146 (B=2 **5.368**, B=4 6.585) |
-| + L2 prefetch of the MoE down-shard weights issued at o_proj time for M=3..4 (`K3PF_MOE=1 K3PF_MOE_MIN_M=3`; M=2 loses to a CTA-dispatch-order effect) (`pfmoe3`) | 4.582 | 8.143 (B=2 5.366, B=4 **6.515**) |
+| + L2 prefetch of the MoE down-shard weights issued at o_proj time for M=3..4 (`K3PF_MOE=1 K3PF_MOE_MIN_M=3`; M=2 loses to a CTA-dispatch-order effect) (`pfmoe3`) | 4.582 | 8.143 (B=2 5.366, B=4 6.515) |
+| + the same prefetch up to M=8, launched with high priority, max-shared carveout and an 8-CTA grid so it is not queued behind route_shared's CTAs (`pfmoe8g`) | **4.577** | **8.087** (B=2 5.369, B=4 6.526) |
 | (separately measured, GSM8K pending) evict_first weight TMAs in route_shared / routing-only MoE block, `K3EF=route,mla` on `stack1` (`efall`) | 4.892 | - (B=2 5.437, B=4 6.638) |
 
 Next: per-layer persistent kernels (ATTN / MOE / TAIL). See `DESIGN_PLAN.md` for the plan to get B=1/B=2 past the TPU.
