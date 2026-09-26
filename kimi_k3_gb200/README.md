@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **203.3 (4.920 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **358.0 (5.586 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **590.5 (6.774 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **936.2 (8.545 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **204.3 (4.895 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **363.9 (5.496 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **593.6 (6.738 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **973.1 (8.221 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -142,7 +142,8 @@ source files are edited; the patches are installed at plugin registration.
 | + step-overhead round 2 with the layer-0 fuse fix (`stepov2b`) | 5.151 | 8.792 (B=2 5.804, B=4 6.999) |
 | + routing-first MoE front end at M=1 (`k3mf.moe_block_front`: router/top-16 on the o_proj-published x_moe, FC1/FC2 in one kernel) + moe8 v10 (L2 evict-first weight TMAs) (`front1m1b`) | **5.017** | **8.545** (B=2 5.687, B=4 6.838) |
 | + moe8 v11: per-token-capacity kernel instantiation MT in {1,2,4,8} (`v11`) | 5.038 | 8.582 (B=2 5.586, B=4 6.774) |
-| + L2 evict_first cache hint on the MoE front kernel's read-once weight TMAs, so dead weights stop crowding the next kernels' L2 working set (`v11ef`) | **4.920** | 8.586 (B=2 **5.582**, B=4 **6.777**) |
+| + L2 evict_first cache hint on the MoE front kernel's read-once weight TMAs, so dead weights stop crowding the next kernels' L2 working set (`v11ef`) | 4.920 | 8.586 (B=2 5.582, B=4 6.777) |
+| + M=1/M=2 dense-GEMM plans: CuTe skinny with static K (weights prefetched before the PDL wait, streaming cache mode), and FlashInfer split-K rebuilt with evict_first weight TMAs for M=3..16 (`stack1`) | **4.895** | **8.221** (B=2 **5.496**, B=4 **6.738**) |
 
 Next: per-layer persistent kernels (ATTN / MOE / TAIL). See `DESIGN_PLAN.md` for the plan to get B=1/B=2 past the TPU.
 

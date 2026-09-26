@@ -541,6 +541,9 @@ def register():
     if _flag("K3OPT_STEPOV"):
         from stepov_patch import patch_stepov
         patch_stepov(_load_ext)
+    if _flag("K3OPT_UPENTRY"):  # PLAN A3: vLLM up-proj with launch_dependents at entry (KDA agent)
+        from upentry_patch import patch_upentry
+        patch_upentry()
     if _flag("K3OPT_GEMV"):
         from gemv_patch import patch_gemv
         patch_gemv(_load_ext)
