@@ -69,7 +69,7 @@ _STATE = {
     "orig_mla_forward": None,
     "orig_attn_res": None,
     "all_reduce": None,
-    "stats": {"fused": 0, "split": 0, "fallback": 0, "deferred": 0},
+    "stats": {"fused": 0, "split": 0, "fallback": 0, "deferred": 0, "xmoe_publish": 0},
 }
 
 

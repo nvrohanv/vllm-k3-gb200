@@ -34,6 +34,10 @@
 //   x -> MXFP8 is done in every CTA (loads issued during the dedupe); xready[ks] barriers release
 //   the MMA warp per K-stage.
 //
+// v11: the kernel is instantiated per token capacity MT (1, 2, 4, 8): the owner's SiTU / MXFP8 path of the
+// FC1 -> FC2 hand-off (on the critical path at small M) and the per-token loops run MT columns only, and at
+// MT <= 2 the expert dedupe is skipped (the pairs are the experts). v10 -> v11: M = 1 11.56 -> 10.13 us,
+// M = 2 13.51 -> 12.45, M = 4 18.1 -> 17.5, M = 8 27.86 -> 27.78.
 // Weight loads use an L2 evict-first cache policy (single-use stream; keeps L2 for x / partials / h images and
 // other layers' data): measured M = 8 29.8 -> 27.9 us, M = 4 18.8 -> 18.0 us (-DMOE8_EVICT_NORMAL to disable).
 // x loads are issued after the expert dedupe (-DMOE8_XLOAD_EARLY for the old order).
@@ -76,7 +80,13 @@ constexpr int kSlots = MOE8_SLOTS;
 #define MOE8_ACC 16
 #endif
 constexpr int kAcc = MOE8_ACC;
-constexpr int kThreads = 384;  // 12 warps; two epilogue groups (warps 4..7, 8..11)
+constexpr int kThreads = 384;
+#ifndef MOE8_GROUP_MIN_D
+#define MOE8_GROUP_MIN_D 40
+#endif
+#ifndef MOE8_GROUP_A_PCT
+#define MOE8_GROUP_A_PCT 50
+#endif  // 12 warps; two epilogue groups (warps 4..7, 8..11)
 constexpr int kMaxG = 160;
 
 // smem layout (offsets from a 1024-aligned base)
@@ -237,6 +247,9 @@ __device__ __forceinline__ int split_lo(int c, int total, int G) {
   return static_cast<int>(static_cast<unsigned>(c * total) / static_cast<unsigned>(G));  // < 2^31
 }
 
+// MT: token capacity of the instantiation (1, 2, 4, 8 >= M): the owner's SiTU / MXFP8 path and the per-token
+// loops only run MT columns (rows t >= M of the accumulators are zero, their h rows and scales are written as 0).
+template <int MT>
 __global__ void __launch_bounds__(kThreads, 1)
 moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CUtensorMap tmA2, const Params p) {
   // No static smem in this kernel, so the dynamic smem window starts 1024-aligned; using the array
@@ -289,13 +302,30 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
 
   // ---- routing ids + per-CTA call parity (one round trip); dedupe experts in first-occurrence order
   const int npairs = M * kTopK;
+#ifndef MOE8_DEDUPE_ALL_M
+  // M <= 2 (MT <= 2 instantiations): no dedupe pass; the 16M (token, slot) pairs are the experts (a routed
+  // expert shared by the two tokens is streamed twice: ~1.5% of the bytes at M = 2 on random routing).
+  constexpr bool nodedup = MT <= 2;
+#else
+  constexpr bool nodedup = false;
+#endif
   int myid = -1;
   if (threadIdx.x < kMaxPairs) {
-    if (threadIdx.x < npairs) myid = p.topk_ids[threadIdx.x];
-    *reinterpret_cast<uint2*>(ms.tokslot[threadIdx.x]) = make_uint2(~0u, ~0u);
+    uint2 ts = make_uint2(~0u, ~0u);
+    if (threadIdx.x < npairs) {
+      myid = p.topk_ids[threadIdx.x];
+      if (nodedup) {
+        ms.expert[threadIdx.x] = myid;
+        const uint32_t byte = static_cast<uint32_t>(threadIdx.x % kTopK);
+        if (threadIdx.x < kTopK) ts.x = (ts.x & ~0xffu) | byte;
+        else ts.x = (ts.x & ~0xff00u) | (byte << 8);
+      }
+    }
+    *reinterpret_cast<uint2*>(ms.tokslot[threadIdx.x]) = ts;
   }
   int* ctr = reinterpret_cast<int*>(p.ws + kWsCtr);
   if (threadIdx.x == 160) ms.parity = ctr[cta];
+  if (nodedup && threadIdx.x == 0) ms.D = npairs;
   __syncthreads();
   // x does not depend on the routing: warps 2..11 issue their x loads once the routing ids are in (so the ids load is not queued behind them), overlapping the rest of the dedupe.
   // Thread xtid, round r: block j = xtid % 64 (token j/8, 32-block j%8) of K-stage 5r + xtid/64.
@@ -308,12 +338,18 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       const bool ok = ks < kFc1Stages && t < M;
       const uint4* src = reinterpret_cast<const uint4*>(p.x + t * kHidden + (ok ? ks : 0) * 256 + kbl * 32);
 #pragma unroll
+#ifdef MOE8_DBG_NO_XLOAD  // timing experiment only (wrong results): no x loads, quantization kept
+      for (int v = 0; v < 4; ++v) xraw[r][v] = make_uint4(ok ? 0x3f803f80u : 0u, 0, 0, 0);
+      (void)src;
+#else
       for (int v = 0; v < 4; ++v) xraw[r][v] = ok ? src[v] : make_uint4(0, 0, 0, 0);
+#endif
     }
   };
 #ifdef MOE8_XLOAD_EARLY
   if (warp >= 2) load_x();
 #endif
+  if (!nodedup) {
   if (threadIdx.x < npairs) atomicMin(&table[myid], static_cast<int>(threadIdx.x));
   __syncthreads();
   if (threadIdx.x < kMaxPairs) {
@@ -334,6 +370,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
     if (i < npairs) ms.tokslot[ms.uof[firstk]][i / kTopK] = static_cast<signed char>(i % kTopK);
   }
   __syncthreads();
+  }  // !nodedup
 #if !defined(MOE8_XLOAD_EARLY) && !defined(MOE8_XAFTER)
   // x loads after the dedupe: at M = 8 the 60 KB/CTA of x requests otherwise stall the dedupe's barriers in
   // the LSU queue; the MMA is gated per K-stage by xready[] anyway.
@@ -345,17 +382,15 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
   const int P = ms.parity & 1;
   // Two expert groups: FC1(A), FC1(B), FC2(A), FC2(B). Group A's h is ready long before FC2(A)
   // starts, and FC2(A) covers the latency of group B's FC1 -> h hand-off.
-#ifndef MOE8_GROUP_MIN_D
-#define MOE8_GROUP_MIN_D 40
-#endif
-#ifndef MOE8_GROUP_A_PCT
-#define MOE8_GROUP_A_PCT 50
-#endif
   // group A gets MOE8_GROUP_A_PCT % of the experts: a smaller group B leaves h(B) more slack behind FC2(A)
   const int ub[3] = {0, D > MOE8_GROUP_MIN_D ? (D * MOE8_GROUP_A_PCT + 99) / 100 : D, D};
   // remote-partial prefetch (warp 3) only with two expert groups: at M <= 2 it measured slower
 #ifdef MOE8_PF_PARTIAL
+#ifdef MOE8_PF_ALL_M
+  const bool pf_on = true;
+#else
   const bool pf_on = D > MOE8_GROUP_MIN_D;
+#endif
 #else
   const bool pf_on = false;
 #endif
@@ -566,6 +601,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
         tc::mbar_wait(&ms.full[slot], phase);
         tc::tc_fence_after();
         w_full += PCLK() - c0;
+        if (kTraceOn && n_st == 0 && lane == 0) trace_ev(p, 9);
         const Meta m = ms.meta[slot];
         if (m.type == kEnd) {
           if (lane == 0) {
@@ -603,6 +639,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
                         tmem + kColSFA + slot * 8, sfa_src0 + slot * 64, tmem + kColSFBx + 8 * ks, xsf_src0 + ks * 16,
                         copy_sfb, first ? 0u : 1u, bar_empty0 + slot * 8, last ? bar_acc0 + acc * 8 : 0u);
           __syncwarp();
+          if (kTraceOn && n_st == 0 && lane == 0) trace_ev(p, 10);
           if (last) acc_release(m);
         } else {
           uint32_t copy_sfb = 0, bar_hrel = 0;
@@ -719,7 +756,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             if (!__any_sync(0xffffffffu, bad)) break;
             __nanosleep(64);
           }
-          uint4* dst = reinterpret_cast<uint4*>(sm + kOffPf + (g * kPfSlots + i) * 4096);
+          uint4* dst = reinterpret_cast<uint4*>(sm + kOffPf + (g * kPfSlots + i) * (M * 512));
           const uint4 ff4 = make_uint4(~0u, ~0u, ~0u, ~0u);
 #pragma unroll
           for (int q = 0; q < 8; ++q) {
@@ -771,7 +808,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           if (s0 < f1lo[g]) {  // not the owner: publish the partial
             float* dst = pbase + (static_cast<long>(g) * kMaxG + cta) * 1024 + row;
 #pragma unroll
-            for (int t = 0; t < kMaxM; ++t)
+            for (int t = 0; t < MT; ++t)
               if (t < M) dst[t * 128] = v[t];
             continue;
           }
@@ -784,9 +821,9 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
 #ifdef MOE8_PF_PARTIAL
             if (pf_on && ipf < kPfSlots) {  // prefetched by warp 3 (and already re-armed there)
               tc::mbar_wait(&ms.pfbar[g][ipf], 0);
-              const float* pf = reinterpret_cast<const float*>(sm + kOffPf + (g * kPfSlots + ipf) * 4096) + row;
+              const float* pf = reinterpret_cast<const float*>(sm + kOffPf + (g * kPfSlots + ipf) * (M * 512)) + row;
 #pragma unroll
-              for (int t = 0; t < kMaxM; ++t)
+              for (int t = 0; t < MT; ++t)
                 if (t < M) v[t] += pf[t * 128];
               ++ipf;
               continue;
@@ -797,7 +834,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             for (;;) {
               bool bad = false;
 #pragma unroll
-              for (int t = 0; t < kMaxM; ++t) {
+              for (int t = 0; t < MT; ++t) {
                 pv[t] = 0.f;
                 if (t < M) {
                   const uint32_t w = ld_volatile_u32(src + t * 128);
@@ -808,7 +845,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
               if (!__any_sync(0xffffffffu, bad)) break;
             }
 #pragma unroll
-            for (int t = 0; t < kMaxM; ++t)
+            for (int t = 0; t < MT; ++t)
               if (t < M) {
                 v[t] += pv[t];
                 src[t * 128] = __uint_as_float(0xffffffffu);
@@ -817,27 +854,27 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           if (eg == 0 && ew == 0 && lane == 0) trace_ev(p, 24);
           if (ew == 0 && lane == 0 && T < 400) trace_at(p, 400 + T, static_cast<long long>(tc::globaltimer()));
           const int u = T / 3, r = T % 3;
-          float h[8], am[8];
+          float h[MT], am[MT];
 #pragma unroll
-          for (int t = 0; t < 8; ++t) {
+          for (int t = 0; t < MT; ++t) {
             const float o = __shfl_xor_sync(0xffffffffu, v[t], 8);  // the gate row sits 8 lanes up
             const float hv = p.beta_lb * tanh_fast(o * p.inv_beta) * sigmoid_fast(o) * tanh_fast(v[t] * p.inv_lb);
             h[t] = up_lane ? hv : 0.f;
             am[t] = fabsf(h[t]);
           }
 #pragma unroll
-          for (int t = 0; t < 8; ++t) {
+          for (int t = 0; t < MT; ++t) {
 #pragma unroll
             for (int off = 1; off < 32; off <<= 1) am[t] = fmaxf(am[t], __shfl_xor_sync(0xffffffffu, am[t], off));
           }
           if (lane == 0) {
 #pragma unroll
-            for (int t = 0; t < 8; ++t) ms.amax[eg][ew][t] = am[t];
+            for (int t = 0; t < MT; ++t) ms.amax[eg][ew][t] = am[t];
           }
           asm volatile("bar.sync %0, 128;" ::"r"(ebar) : "memory");
           int sbt = 0;
 #pragma unroll
-          for (int t = 0; t < 8; ++t) {
+          for (int t = 0; t < MT; ++t) {
             const int sb = mx_exp(fmaxf(am[t], ms.amax[eg][ew ^ 1][t]));
             if (lane == t) sbt = sb;
             if (up_lane)
@@ -846,9 +883,9 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           }
           __syncwarp();
           uint8_t* himg = hset + static_cast<long>(u) * kHImg;
-          if (lane < 8) {
+          if (lane < 8) {  // all 8 rows are written (the FC2 side validates every row); rows t >= MT are 0
             const int t = lane, kc = 4 * r + ew;
-            const uint4 val = *reinterpret_cast<const uint4*>(ms.hst[eg][ew][t]);
+            const uint4 val = t < MT ? *reinterpret_cast<const uint4*>(ms.hst[eg][ew][t]) : make_uint4(0, 0, 0, 0);
             *reinterpret_cast<uint4*>(himg + (kc / 8) * 1024 + t * 128 + (((kc % 8) ^ t) * 16)) = val;
             if ((ew & 1) == 0) himg[2048 + t * 16 + 2 * r + ew / 2] = static_cast<uint8_t>(sbt);
           }
@@ -862,7 +899,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           const int n = mt * 128 + 32 * ew + 4 * (lane % 8) + lane / 8;
           const uint2 ts = *reinterpret_cast<const uint2*>(ms.tokslot[u]);
 #pragma unroll
-          for (int t = 0; t < kMaxM; ++t) {
+          for (int t = 0; t < MT; ++t) {
             const int j = static_cast<signed char>(((t < 4 ? ts.x : ts.y) >> (8 * (t & 3))) & 0xff);
             if (j >= 0) {  // warp-uniform
               const float o = __shfl_down_sync(0xffffffffu, v[t], 8);
@@ -956,7 +993,10 @@ void launch(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::
   static int sms = 0;
   if (sms == 0) {
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
   }
   TORCH_CHECK(sms <= kMaxG);
   // Tensor maps per weight pair (one entry per MoE layer), encoded once; passed by value as kernel
@@ -1006,14 +1046,22 @@ void launch(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::
   cudaLaunchConfig_t cfg{};
   cfg.gridDim = dim3(sms);
   cfg.blockDim = dim3(kThreads);
+#ifdef MOE8_PF_PARTIAL
+  // prefetch buffers sized by M (fp32 [M][128] per slot): a smaller smem request leaves more L1 at small M
+  cfg.dynamicSmemBytes = kOffPf + 2 * kPfSlots * M * 512;
+#else
   cfg.dynamicSmemBytes = kSmemBytes;
+#endif
   cfg.stream = c10::cuda::getCurrentCUDAStream();
   cudaLaunchAttribute attr[1];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attr[0].val.programmaticStreamSerializationAllowed = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel, mc->a1, mc->a2, prm));
+  if (M == 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<1>, mc->a1, mc->a2, prm));
+  else if (M == 2) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<2>, mc->a1, mc->a2, prm));
+  else if (M <= 4) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<4>, mc->a1, mc->a2, prm));
+  else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<8>, mc->a1, mc->a2, prm));
 }
 
 }  // namespace moe8

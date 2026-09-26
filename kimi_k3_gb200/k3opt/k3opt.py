@@ -26,6 +26,12 @@ K3OPT_TAILATTN=1
                MoE-tail Lamport mailbox consumed directly by the next layer's
                pre-attention AttnRes (k3tail.lamport_attn_res; see
                agents/tailattn/INTEGRATION.md), removing the Lamport copy kernel.
+K3OPT_ATTNFRONT=1
+               (agents/l2pf, needs K3OPT_TAILATTN) Decode M <= K3AF_MAX_M (4): the MoE-tail mailbox consume, the
+               pre-attention AttnRes and the KDA in_proj (+ MLA fused_qkv_a_g with K3AF_MLA=1) run as one
+               tcgen05 kernel (k3sgt.attnres_inproj, 15 x 8-CTA clusters, weights staged during the hop).
+               K3AF_PF=inkernel|skip|keep: k3pf for the fused batches (default: none, prefetch in-kernel).
+               K3AF_DISABLE=1 turns it off.
 K3OPT_ROUTE=1  Compute MoE top-k in the router branch (which already runs in
                parallel with the latent down-projection on the aux stream) and
                call FlashInfer's pre-routed TRT-LLM MXFP4 MoE, so the routing
@@ -508,6 +514,12 @@ def register():
     if _flag("K3OPT_KDA6") and _flag("K3OPT_KDAFB"):
         from kda_fb_patch import patch_kda_fb
         patch_kda_fb(_load_ext)
+    if _flag("K3OPT_ATTNFRONT"):
+        # after tailattn (mailbox registry + fallback consumer) and kda_fb (fused f_b + KDA decode dispatcher)
+        if not _flag("K3OPT_TAILATTN"):
+            raise RuntimeError("K3OPT_ATTNFRONT needs K3OPT_TAILATTN=1")
+        from attnfront_patch import patch_attnfront
+        patch_attnfront(_load_ext)
     if _flag("K3OPT_MLA"):
         from mla_patch import patch_mla
         patch_mla(_load_ext)

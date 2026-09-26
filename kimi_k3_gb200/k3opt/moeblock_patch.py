@@ -639,7 +639,7 @@ def _forward_front(moe, s, x, m, par, num_tokens, hidden):
         xc.view(torch.int16)[xc.view(torch.int16) == -32768] = 0
         if not torch.equal(fb["xmoe"][par, 0, :m].view(torch.int16), xc.view(torch.int16)):
             raise RuntimeError(f"K3MOEFRONT: x_moe published for layer {getattr(moe, 'layer_idx', '?')} != MoE input")
-    _STATE["stats"]["front"] += 1
+    _STATE["stats"]["front"] = _STATE["stats"].get("front", 0) + 1
     runner = s["runner"]
     tail = s.get("tail")
     try:  # K3OPT_L2PF: same fork point as the other paths (after FC2, before the tail)
@@ -726,6 +726,17 @@ def patch_moeblock(load_ext) -> None:
             orig_init(self, *args, **kwargs)
             # collective symmetric-memory setup at model init (every rank, same order)
             _k3mk_buffers() if _TAIL_MODE == "k3mk" else _tail_buffers()
+
+        KimiMoE.__init__ = __init__
+    if _FRONT:
+        orig_init_f = KimiMoE.__init__
+
+        def __init__(self, *args, **kwargs):
+            orig_init_f(self, *args, **kwargs)
+            # W1-3: the x_moe / exchange buffers are allocated and armed eagerly here (model construction):
+            # a first allocation inside CUDA-graph capture would come from the graph's pool and its fills
+            # would be recorded into the graph.
+            front_buffers(torch.device("cuda", torch.cuda.current_device()))
 
         KimiMoE.__init__ = __init__
 

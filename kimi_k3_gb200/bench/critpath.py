@@ -20,16 +20,21 @@ kernels = sorted((e for e in events if e.get("ph") == "X" and e.get("cat") in ("
 # Main (graph-replay) stream = the one running the MoE-tail collective; fall back to the busiest.
 _tail = collections.Counter(e["tid"] for e in kernels if "allreduce_rmsnorm_reduce_scatter" in e["name"])
 main_tid = (_tail or collections.Counter(e["tid"] for e in kernels)).most_common(1)[0][0]
+def _is_emb(n):  # vLLM embedding, or stepov's NVLS embedding broadcast
+    return "vocab_parallel_embedding" in n or "embed_bcast_kernel" in n
+
+
 # Step marker: the embedding kernel, which may run on another stream than the
 # graph-replay main stream. Mark the first main-stream kernel after each one.
-emb_ts = [e["ts"] for e in kernels if "vocab_parallel_embedding" in e["name"]]
-main = [e for e in kernels if e["tid"] == main_tid or "vocab_parallel_embedding" in e["name"]]
+emb_ts = [e["ts"] for e in kernels if _is_emb(e["name"])]
+main = [e for e in kernels if e["tid"] == main_tid or _is_emb(e["name"])]
 main.sort(key=lambda e: e["ts"])
-marks = [i for i, e in enumerate(main) if "vocab_parallel_embedding" in e["name"]]
+marks = [i for i, e in enumerate(main) if _is_emb(e["name"])]
 
 
 def norm(name):
     name = re.sub(r"^void ", "", name)
+    name = name.replace("(anonymous namespace)::", "")
     name = re.sub(r"kernel_cutlass_kernel_vllm(model_executorkernelslinearcute_dsl_|modelskimi_k3nvidiaopscute_dsl)", "", name)
     name = re.sub(r"_object_at_.*", "", name)
     name = re.sub(r"<.*", "", name)
