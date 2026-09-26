@@ -428,6 +428,9 @@ def _build_layer_state(moe):
                             eps=float(top.contract.rms_eps), mb=upp._mailbox, mb_mc=int(upp._mailbox_multicast_ptr),
                             parity=int(getattr(moe, "layer_idx", 0) or 0) & 1,
                             par3=int(getattr(moe, "layer_idx", 0) or 0) % 3)
+                if os.environ.get("K3MK_DEBUG_PAR", "0") == "1":  # consecutive MoE layers must differ in par3
+                    print(f"[k3opt] K3MK: layer_idx {getattr(moe, 'layer_idx', None)!r} -> par3 {tail['par3']}",
+                          flush=True)
             else:
                 print("[k3opt] K3MOEBLOCK_TAIL: up_proj / norm layout, keeping vLLM's tail", flush=True)
     return dict(
@@ -526,15 +529,14 @@ def _forward_small(moe, s, hidden_states):
                                  kb["rs_peers"], par, kb["rank"], True)
             front = (None, None, None, 0, None)
         runner = s["runner"]
-        try:  # K3OPT_L2PF: same fork point as below (after FC2, before the tail)
-            import l2pf_patch
-            if l2pf_patch._STATE["patched"]:
-                l2pf_patch.launch_after_moe(runner, m)
-        except ImportError:
-            pass
+        pf_mode = _k3mk_pf_mode()
+        if pf_mode == "before":  # K3OPT_L2PF: same fork point as below (after FC2, before the tail)
+            _l2pf_fork(runner, m)
         KM.tail(kb["lat"], kb["rs"], par, tail["w_up"], tail["gamma"], tail["eps"], tail["mb"], tail["mb_mc"],
                 kb["epoch"], kb["rank"], m, None, front[0], front[1], front[2], front[3], front[4], True,
                 kb["variant"])
+        if pf_mode == "after":
+            _l2pf_fork(runner, m)
         _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, h_sh, scores, workspace]
         result = _tail_result(runner, tail, m)
         _STATE["stats"]["tail_k3mk"] = _STATE["stats"].get("tail_k3mk", 0) + 1
@@ -610,6 +612,23 @@ def _forward_small(moe, s, hidden_states):
     return result.view(num_tokens, hidden)
 
 
+def _k3mk_pf_mode() -> str:
+    """K3MK_PF = before (default) | after | off: where the next layer's L2 prefetch (k3pf) is forked on layers
+    whose tail is k3mk.tail - right before the TAIL (as the other tails), right after it, or not at all. For
+    isolating the B1 regression of K3MOEBLOCK_TAIL=k3mk (agents/moefused/RESULTS.md)."""
+    v = os.environ.get("K3MK_PF", "before").strip().lower()
+    return v if v in ("before", "after", "off") else "before"
+
+
+def _l2pf_fork(runner, m) -> None:
+    try:
+        import l2pf_patch
+        if l2pf_patch._STATE["patched"]:
+            l2pf_patch.launch_after_moe(runner, m)
+    except ImportError:
+        pass
+
+
 def _forward_front(moe, s, x, m, par, num_tokens, hidden):
     """W1-3: steps 1-3 of _forward_small in ONE kernel (k3mf.moe_block_front). x_moe comes from the
     post-attention op's publish (same values as x: KimiDecoderLayer feeds post-attn-norm's output to the MoE),
@@ -642,18 +661,18 @@ def _forward_front(moe, s, x, m, par, num_tokens, hidden):
     _STATE["stats"]["front"] = _STATE["stats"].get("front", 0) + 1
     runner = s["runner"]
     tail = s.get("tail")
-    try:  # K3OPT_L2PF: same fork point as the other paths (after FC2, before the tail)
-        import l2pf_patch
-        if l2pf_patch._STATE["patched"]:
-            l2pf_patch.launch_after_moe(runner, m)
-    except ImportError:
-        pass
-    if tail is not None and _TAIL_MODE == "k3mk" and _TAIL.get("k3mk"):
+    k3mk_tail = tail is not None and _TAIL_MODE == "k3mk" and bool(_TAIL.get("k3mk"))
+    pf_mode = _k3mk_pf_mode() if k3mk_tail else "before"
+    if pf_mode == "before":  # K3OPT_L2PF: same fork point as the other paths (after FC2, before the tail)
+        _l2pf_fork(runner, m)
+    if k3mk_tail:
         # k3mk.tail FRONT mode: finalizes gemm2 / wts / shared_out (griddepcontrol.wait on the front kernel)
         kb = _TAIL["k3mk"]
         torch.ops.k3mk.tail(kb["lat"], kb["rs"], tail["par3"], tail["w_up"], tail["gamma"], tail["eps"], tail["mb"],
                             tail["mb_mc"], kb["epoch"], kb["rank"], m, None, gemm2, wts, shared_out, kb["lat_mc"],
                             kb["rs_peers"], True, kb["variant"])
+        if pf_mode == "after":
+            _l2pf_fork(runner, m)
         _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace]
         _STATE["stats"]["tail_k3mk"] = _STATE["stats"].get("tail_k3mk", 0) + 1
         return _tail_result(runner, tail, m).view(num_tokens, hidden)

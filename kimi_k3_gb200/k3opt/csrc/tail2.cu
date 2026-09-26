@@ -2921,8 +2921,10 @@ __device__ __forceinline__ void t2_gemv_mt(const uint8_t* sm, const __nv_bfloat1
   }
 }
 
-template <int kNC, bool kMT = false>  // kMT: M = 3 / 4 instantiation with the all-tokens GEMV (own registers)
-__global__ void __launch_bounds__(kT2Threads, 1)
+// kMinB = 2 (variant + 1000): <= 64 registers per thread, so a TAIL CTA holds half an SM's register file instead of
+// all of it and concurrent kernels (side streams, PDL-early successors) can co-reside (costs ~1 us standalone).
+template <int kNC, bool kMT = false, int kMinB = 1>  // kMT: M = 3 / 4 instantiation with the all-tokens GEMV
+__global__ void __launch_bounds__(kT2Threads, kMinB)
 tail2_kernel(const __grid_constant__ CUtensorMap tm_w, const __grid_constant__ T2Args a) {
   constexpr int kR = kUpShard / kNC;   // up-proj rows per cluster (64 or 32)
   constexpr int kRo = kR / kT2Cl;      // owner rows per CTA (8 or 4)
@@ -3944,6 +3946,8 @@ void tail(torch::Tensor lat_mb, torch::Tensor rs_mb, int64_t par, torch::Tensor 
   // variant: 0 = default (env K3MK_TAIL_VARIANT, else 14 clusters), 7 / 14 = clusters x 8 CTAs, 4 = 8 x 4, 1 = flat
   static const int env_variant = getenv("K3MK_TAIL_VARIANT") ? atoi(getenv("K3MK_TAIL_VARIANT")) : 14;
   int v = variant ? static_cast<int>(variant) : env_variant;
+  const bool lowreg = v >= 1000;  // variant + 1000: the <= 64-register instantiation (kMinB = 2)
+  v %= 1000;
   const bool defer_w = v >= 100;  // variant + 100: 8-CTA kernels stage W_up after the RMS exchange
   v %= 100;
   TORCH_CHECK(v == 7 || v == 14 || v == 1 || v == 4,
@@ -4018,6 +4022,12 @@ void tail(torch::Tensor lat_mb, torch::Tensor rs_mb, int64_t par, torch::Tensor 
                                         static_cast<int>(tail2_smem<14>(kT2MaxM))));
     C10_CUDA_CHECK(cudaFuncSetAttribute(tail2_kernel<14, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(tail2_smem<14>(kT2MaxM))));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(tail2_kernel<7, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(tail2_smem<7>(kT2MaxM))));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(tail2_kernel<14, false, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(tail2_smem<14>(kT2MaxM))));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(tail2_kernel<14, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(tail2_smem<14>(kT2MaxM))));
     C10_CUDA_CHECK(cudaFuncSetAttribute(tail_c4_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(tail_c4_smem(kC4MaxM))));
     init = true;
@@ -4056,7 +4066,14 @@ void tail(torch::Tensor lat_mb, torch::Tensor rs_mb, int64_t par, torch::Tensor 
   cfg.attrs = attr;
   cfg.numAttrs = 2;
   const CUtensorMap tmv = *tm;
-  if (nc == 7)
+  if (lowreg) {
+    if (nc == 7)
+      C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, tail2_kernel<7, false, 2>, tmv, a));
+    else if (M == 3 || M == 4)
+      C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, tail2_kernel<14, true, 2>, tmv, a));
+    else
+      C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, tail2_kernel<14, false, 2>, tmv, a));
+  } else if (nc == 7)
     C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, tail2_kernel<7>, tmv, a));
   else if (M == 3 || M == 4)
     C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, tail2_kernel<14, true>, tmv, a));

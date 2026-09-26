@@ -1,3 +1,4 @@
+#define K3MF_EF 1  // l2pf evict_first weight TMAs (coordinator deploy, 2026-09-26)
 // moefused v2 (agents/moefused): k3moe.moe_fused / k3moe.moe_fused_unfinalized rewritten as a
 // one-CTA-per-SM TMA-pipelined kernel (M <= 8); k3moe.moe_small unchanged. See RESULTS.md.
 // Small-batch (decode) MXFP4 MoE for Kimi K3 at TP16, reading vLLM's TRT-LLM
@@ -331,34 +332,79 @@ __device__ __forceinline__ void mbar_wait_sleep(uint32_t bar, uint32_t parity, i
     __nanosleep(ns);
   }
 }
+// K3MF_EF (l2pf 2026-09-26): all TMA loads of this kernel are single-use weight streams (x comes from the Lamport
+// mailbox in front mode) -> .L2::cache_hint evict_first, so the dead weights do not stay in L2 at evict_normal.
+#ifdef K3MF_EF
+#define K3MF_POL uint64_t pol; asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+#define K3MF_HINT ".L2::cache_hint"
+#define K3MF_POLARG , "l"(pol)
+#else
+#define K3MF_POL
+#define K3MF_HINT ""
+#define K3MF_POLARG
+#endif
 __device__ __forceinline__ void tma_1d(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+  K3MF_POL
+#ifdef K3MF_EF
+  asm volatile(
+      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+      ::"r"(dst), "l"(src), "r"(bytes), "r"(bar), "l"(pol) : "memory");
+#else
   asm volatile(
       "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];" ::"r"(dst),
       "l"(src), "r"(bytes), "r"(bar)
       : "memory");
+#endif
 }
 __device__ __forceinline__ void tma_2d(uint32_t dst, const CUtensorMap* map, int c0, int c1, uint32_t bar) {
+  K3MF_POL
+#ifdef K3MF_EF
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint [%0], "
+      "[%1, {%2, %3}], [%4], %5;" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(bar), "l"(pol)
+      : "memory");
+#else
   asm volatile(
       "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], "
       "[%4];" ::"r"(dst),
       "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(bar)
       : "memory");
+#endif
 }
 __device__ __forceinline__ void tma_3d(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2,
                                        uint32_t bar) {
+  K3MF_POL
+#ifdef K3MF_EF
+  asm volatile(
+      "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint [%0], "
+      "[%1, {%2, %3, %4}], [%5], %6;" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(c2), "r"(bar), "l"(pol)
+      : "memory");
+#else
   asm volatile(
       "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4}], "
       "[%5];" ::"r"(dst),
       "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(c2), "r"(bar)
       : "memory");
+#endif
 }
 __device__ __forceinline__ void tma_4d(uint32_t dst, const CUtensorMap* map, int c0, int c1, int c2, int c3,
                                        uint32_t bar) {
+  K3MF_POL
+#ifdef K3MF_EF
+  asm volatile(
+      "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint [%0], "
+      "[%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(dst),
+      "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(bar), "l"(pol)
+      : "memory");
+#else
   asm volatile(
       "cp.async.bulk.tensor.4d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3, %4, "
       "%5}], [%6];" ::"r"(dst),
       "l"(reinterpret_cast<uint64_t>(map)), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(bar)
       : "memory");
+#endif
 }
 __device__ __forceinline__ void consumer_sync() {
   asm volatile("bar.sync 1, %0;" ::"n"(kConsumerThreads) : "memory");
