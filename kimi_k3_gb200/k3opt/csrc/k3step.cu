@@ -18,6 +18,10 @@
 //   and, if `post` is given, applies vLLM's _post_update_kernel for that row
 //   (last_sampled_tokens, total_len, all_token_ids, output_bin_counts, num_computed_tokens) and
 //   the mamba-hybrid model state's _scatter_num_accepted_kernel (num_accepted = max(ns, 1)).
+//   A4 (optional): also writes sampled / num_sampled into pinned host mirrors (the V2 runner's
+//   AsyncOutput then needs no DtoH copies) and, after every row's scatter, the mamba align
+//   postprocess snapshot of the whole num_accepted buffer (the 64 B DtoD copy of
+//   MambaSpecDecodeGPUContext.run_fused_postprocess_align).
 //   Index / length inputs may be int32 or int64 and strided (no host-side conversion kernels).
 //
 // k3step.embed_bcast                (replaces vocab_parallel_embedding + TP all-reduce)
@@ -252,6 +256,11 @@ struct SampleParams {
   int* num_rejected;
   uint32_t* my_packet;
   PostArgs post;
+  // A4 (stepov item L4): optional folds of the eager copies that follow sampling
+  int64_t* h_sampled;      // host-mapped (pinned, UVA) mirror of sampled [M]: replaces AsyncOutput's DtoH copy
+  int* h_num_sampled;      // host-mapped mirror of num_sampled [M]
+  int32_t* snap;           // mamba align postprocess snapshot of post.num_accepted (whole buffer), or null
+  int snap_n;
 };
 
 __global__ void __launch_bounds__(32 * kMaxM) sample_finish_kernel(const SampleParams p) {
@@ -314,24 +323,34 @@ __global__ void __launch_bounds__(32 * kMaxM) sample_finish_kernel(const SampleP
   }
   g = warp_best(g);
   if (lane < p.world) st8(src, make_uint2(kSentA, kSentA));  // re-arm
-  if (lane != 0) return;
-  const int64_t token = g.id;
-  p.sampled[m] = token;
-  p.num_sampled[m] = ns;
-  p.num_rejected[m] = nr;
-  if (!p.post.enabled || req < 0) return;
-  // vLLM _post_update_kernel for this row (sampled_tokens = [M, 1]); the (possibly host-resident)
-  // all_token_ids store goes first so its latency overlaps the rest.
-  const PostArgs& q = p.post;
-  if (ns > 0) {
-    q.all_token_ids[req * q.tok_stride + total_len] = static_cast<int32_t>(token);
-    q.last_sampled[req * q.last_stride] = token;
-    q.total_len[req] = total_len + ns;
-    if (q.bin_counts != nullptr) atomicAdd(q.bin_counts + req * q.bin_stride + token, 1);
+  if (lane == 0) {
+    const int64_t token = g.id;
+    p.sampled[m] = token;
+    p.num_sampled[m] = ns;
+    p.num_rejected[m] = nr;
+    if (p.h_sampled != nullptr) p.h_sampled[m] = token;  // host mirrors (A4): no DtoH copies afterwards
+    if (p.h_num_sampled != nullptr) p.h_num_sampled[m] = ns;
+    if (p.post.enabled && req >= 0) {
+      // vLLM _post_update_kernel for this row (sampled_tokens = [M, 1]); the (possibly host-resident)
+      // all_token_ids store goes first so its latency overlaps the rest.
+      const PostArgs& q = p.post;
+      if (ns > 0) {
+        q.all_token_ids[req * q.tok_stride + total_len] = static_cast<int32_t>(token);
+        q.last_sampled[req * q.last_stride] = token;
+        q.total_len[req] = total_len + ns;
+        if (q.bin_counts != nullptr) atomicAdd(q.bin_counts + req * q.bin_stride + token, 1);
+      }
+      if (delta != 0) q.num_computed[req] = new_computed;
+      // mamba hybrid model state: num_accepted_tokens[req] = max(num_sampled, 1)
+      if (q.num_accepted != nullptr) q.num_accepted[req] = ns > 1 ? ns : 1;
+    }
   }
-  if (delta != 0) q.num_computed[req] = new_computed;
-  // mamba hybrid model state: num_accepted_tokens[req] = max(num_sampled, 1)
-  if (q.num_accepted != nullptr) q.num_accepted[req] = ns > 1 ? ns : 1;
+  // A4: the mamba align postprocess snapshot (MambaSpecDecodeGPUContext.run_fused_postprocess_align's
+  // 64 B device-to-device copy of the whole num_accepted buffer), taken after every row's scatter.
+  if (p.snap != nullptr) {  // uniform over the block
+    __syncthreads();
+    for (int i = threadIdx.x; i < p.snap_n; i += blockDim.x) p.snap[i] = p.post.num_accepted[i];
+  }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -339,13 +358,31 @@ __global__ void __launch_bounds__(32 * kMaxM) sample_finish_kernel(const SampleP
 // ------------------------------------------------------------------------------------------
 constexpr int kEbThreads = 128;
 
+__device__ __forceinline__ void embed_bcast_body(IView ids, const uint8_t* __restrict__ weight, int64_t w_row_bytes,
+                                                 int64_t vocab, int64_t shard, int rank, uint8_t* __restrict__ mailbox,
+                                                 unsigned long long mc, int frags, int mode, uint8_t* __restrict__ out,
+                                                 int64_t out_row_bytes);
+
 __global__ void __launch_bounds__(kEbThreads)
     embed_bcast_kernel(IView ids, const uint8_t* __restrict__ weight, int64_t w_row_bytes,
                        int64_t vocab, int64_t shard, int rank, uint8_t* __restrict__ mailbox,
                        unsigned long long mc, int frags, int mode, uint8_t* __restrict__ out,
-                       int64_t out_row_bytes, int M) {
+                       int64_t out_row_bytes, int M, unsigned long long* gs) {
   // grid = (ceil(frags / kEbThreads), M): thread handles one 16-byte fragment of token m's row
   pdl_wait();
+  // A2c graph-start probe (optional): gs[0] = min CTA start, gs[1] = max CTA end (reset by gs_stamp)
+  if (gs != nullptr && threadIdx.x == 0) atomicMin(gs, globaltimer());
+  embed_bcast_body(ids, weight, w_row_bytes, vocab, shard, rank, mailbox, mc, frags, mode, out, out_row_bytes);
+  if (gs != nullptr) {  // uniform: every thread returns from the body
+    __syncthreads();
+    if (threadIdx.x == 0) atomicMax(gs + 1, globaltimer());
+  }
+}
+
+__device__ __forceinline__ void embed_bcast_body(IView ids, const uint8_t* __restrict__ weight, int64_t w_row_bytes,
+                                                 int64_t vocab, int64_t shard, int rank, uint8_t* __restrict__ mailbox,
+                                                 unsigned long long mc, int frags, int mode, uint8_t* __restrict__ out,
+                                                 int64_t out_row_bytes) {
   const int m = blockIdx.y;
   const int f = blockIdx.x * kEbThreads + threadIdx.x;
   if (f >= frags) return;
@@ -375,6 +412,20 @@ __global__ void __launch_bounds__(kEbThreads)
   }
   st16(dst, v);
   st16(mailbox + off, U4{{kSentG, kSentG, kSentG, kSentG}});  // re-arm
+}
+
+// A2c graph-start probe: launched (no PDL) right after embed_bcast inside the graph.  ring[3 s .. 3 s + 2] = embed start,
+// embed end, this kernel's start for slot s = step % nslots (ring[3 nslots] = step counter); resets gs.
+__global__ void gs_stamp_kernel(unsigned long long* gs, unsigned long long* ring, int nslots) {
+  const unsigned long long t = globaltimer();
+  if (threadIdx.x != 0) return;
+  const unsigned long long step = atomicAdd(ring + 3 * nslots, 1ull);
+  unsigned long long* r = ring + 3 * (step % nslots);
+  r[0] = gs[0];
+  r[1] = gs[1];
+  r[2] = t;
+  gs[0] = ~0ull;
+  gs[1] = 0ull;
 }
 
 cudaStream_t stream() { return at::cuda::getCurrentCUDAStream().stream(); }
@@ -434,7 +485,10 @@ void sample_finish(const torch::Tensor& local_max, const torch::Tensor& local_ar
                    const std::optional<torch::Tensor>& all_token_ids,
                    const std::optional<torch::Tensor>& output_bin_counts,
                    const std::optional<torch::Tensor>& num_accepted,
-                   const std::optional<torch::Tensor>& my_packet) {
+                   const std::optional<torch::Tensor>& my_packet,
+                   const std::optional<torch::Tensor>& num_accepted_snapshot,
+                   const std::optional<torch::Tensor>& host_sampled,
+                   const std::optional<torch::Tensor>& host_num_sampled) {
   TORCH_CHECK(local_max.is_cuda() && local_max.scalar_type() == at::kFloat &&
                   local_max.dim() == 2 && local_max.is_contiguous(),
               "local_max must be contiguous f32 [M, NB]");
@@ -504,11 +558,34 @@ void sample_finish(const torch::Tensor& local_max, const torch::Tensor& local_ar
                     (!num_accepted.has_value() || num_accepted->is_contiguous()),
                 "per-request state tensors must be contiguous");
   }
+  if (num_accepted_snapshot.has_value()) {
+    TORCH_CHECK(p.post.enabled && p.post.num_accepted != nullptr && num_accepted.has_value(),
+                "num_accepted_snapshot needs the fused post-update with num_accepted");
+    TORCH_CHECK(num_accepted_snapshot->is_cuda() && num_accepted_snapshot->scalar_type() == at::kInt &&
+                    num_accepted_snapshot->is_contiguous() &&
+                    num_accepted_snapshot->numel() == num_accepted->numel(),
+                "num_accepted_snapshot: contiguous i32 with num_accepted's size");
+    p.snap = num_accepted_snapshot->data_ptr<int32_t>();
+    p.snap_n = static_cast<int>(num_accepted_snapshot->numel());
+  }
+  if (host_sampled.has_value()) {
+    TORCH_CHECK(host_sampled->is_pinned() && host_sampled->scalar_type() == at::kLong &&
+                    host_sampled->is_contiguous() && host_sampled->numel() >= p.M,
+                "host_sampled: pinned contiguous i64 [>= M]");
+    p.h_sampled = host_sampled->data_ptr<int64_t>();  // UVA: the host address is valid on the device
+  }
+  if (host_num_sampled.has_value()) {
+    TORCH_CHECK(host_num_sampled->is_pinned() && host_num_sampled->scalar_type() == at::kInt &&
+                    host_num_sampled->is_contiguous() && host_num_sampled->numel() >= p.M,
+                "host_num_sampled: pinned contiguous i32 [>= M]");
+    p.h_num_sampled = host_num_sampled->data_ptr<int32_t>();
+  }
   launch_pdl(sample_finish_kernel, dim3(1), dim3(32 * p.M), stream(), p);
 }
 
 void embed_bcast(const torch::Tensor& ids, const torch::Tensor& weight, int64_t vocab,
-                 int64_t rank, torch::Tensor& mailbox, int64_t mc, int64_t mode, torch::Tensor& out) {
+                 int64_t rank, torch::Tensor& mailbox, int64_t mc, int64_t mode, torch::Tensor& out,
+                 const std::optional<torch::Tensor>& gs) {
   TORCH_CHECK(weight.is_cuda() && weight.scalar_type() == at::kBFloat16 && weight.dim() == 2 &&
                   weight.stride(1) == 1 && (weight.stride(0) * 2) % 16 == 0 &&
                   reinterpret_cast<uintptr_t>(weight.data_ptr()) % 16 == 0,
@@ -532,7 +609,18 @@ void embed_bcast(const torch::Tensor& ids, const torch::Tensor& weight, int64_t 
              static_cast<const uint8_t*>(weight.data_ptr()), static_cast<int64_t>(weight.stride(0) * 2),
              vocab, shard, static_cast<int>(rank), static_cast<uint8_t*>(mailbox.data_ptr()),
              static_cast<unsigned long long>(mc), frags, static_cast<int>(mode),
-             static_cast<uint8_t*>(out.data_ptr()), static_cast<int64_t>(out.stride(0) * 2), M);
+             static_cast<uint8_t*>(out.data_ptr()), static_cast<int64_t>(out.stride(0) * 2), M,
+             gs.has_value() ? reinterpret_cast<unsigned long long*>(gs->data_ptr()) : nullptr);
+}
+
+void gs_stamp(torch::Tensor& gs, torch::Tensor& ring) {
+  TORCH_CHECK(gs.is_cuda() && gs.scalar_type() == at::kLong && gs.numel() >= 2 && ring.is_cuda() &&
+                  ring.scalar_type() == at::kLong && ring.numel() >= 4 && (ring.numel() - 1) % 3 == 0,
+              "gs i64 [2], ring i64 [3 n + 1]");
+  gs_stamp_kernel<<<1, 32, 0, stream()>>>(reinterpret_cast<unsigned long long*>(gs.data_ptr()),
+                                         reinterpret_cast<unsigned long long*>(ring.data_ptr()),
+                                         static_cast<int>((ring.numel() - 1) / 3));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace
@@ -546,13 +634,17 @@ TORCH_LIBRARY(k3step, m) {
         "Tensor? query_start_loc=None, Tensor(e!)? num_computed_tokens=None, "
         "Tensor(f!)? last_sampled_tokens=None, Tensor(g!)? total_len=None, "
         "Tensor(h!)? all_token_ids=None, Tensor(i!)? output_bin_counts=None, "
-        "Tensor(j!)? num_accepted=None, Tensor(k!)? my_packet=None) -> ()");
+        "Tensor(j!)? num_accepted=None, Tensor(k!)? my_packet=None, "
+        "Tensor(l!)? num_accepted_snapshot=None, Tensor(m!)? host_sampled=None, "
+        "Tensor(n!)? host_num_sampled=None) -> ()");
   m.def("embed_bcast(Tensor ids, Tensor weight, int vocab, int rank, Tensor(a!) mailbox, int mc, "
-        "int mode, Tensor(b!) out) -> ()");
+        "int mode, Tensor(b!) out, Tensor(c!)? gs=None) -> ()");
+  m.def("gs_stamp(Tensor(a!) gs, Tensor(b!) ring) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(k3step, CUDA, m) {
   m.impl("allgather", &allgather);
   m.impl("sample_finish", &sample_finish);
   m.impl("embed_bcast", &embed_bcast);
+  m.impl("gs_stamp", &gs_stamp);
 }

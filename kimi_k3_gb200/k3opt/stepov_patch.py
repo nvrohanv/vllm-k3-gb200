@@ -18,13 +18,24 @@ Switches (read at call time unless noted):
   K3STEPOV_LMHEAD_PF_MB=N  lm_head L2 prefetch size in MB (default 48; 0 = off) (5.)  (read at
                            l2pf table build time; _GRID / _CHUNK / _POLICY at graph capture)
   K3STEPOV_PREP_ATTN=0     keep vLLM's gather_block_tables + compute_slot_mappings kernels (3.;
-                           default: folded into k3step.decode_prep_attn when k3step_prep.cu is built)
-  K3STEPOV_FINAL_NORM=0    final RMSNorm stays in compute_logits (6.; read at model construction)
+                           default: folded into k3step.decode_prep_attn when k3step_prep.cu is built;
+                           read at patch time)
+  K3STEPOV_FINAL_NORM=0    final RMSNorm stays in compute_logits (6.; read at patch time)
   K3STEPOV_L0FUSE=1        fuse the layer-0 MLP all-reduce into layer 1's AttnRes (7.; default OFF:
                            the fused k3ar kernel measured 10.5-12 us per call on 16 ranks, about what
                            flashinfer's all-reduce + vLLM's AttnRes take in the trace -- A/B only)
-  K3STEPOV_STATE_ALIAS=0   KDA builders keep their own state-index buffers (8.; decided once,
-                           before the first graph capture)
+  K3STEPOV_STATE_ALIAS=0   KDA builders keep their own state-index buffers (8.; read at patch time and at each
+                           builder's first build)
+  K3STEPOV_HOST_OUT=1      (opt-in since the s_a4 crash) sample_finish writes pinned host mirrors, AsyncOutput
+                           issues no DtoH copies (9.; patch time)
+  K3STEPOV_SNAPSHOT=1      (opt-in since the s_a4 crash) sample_finish writes the mamba align postprocess
+                           num_accepted snapshot, its 64 B DtoD copy is skipped (9.; patch time)
+  K3STEPOV_A4_CHECK=1      (debug) verify the host mirrors / snapshot after every sample (one host sync per step)
+  K3STEPOV_FINAL_FOLD=1    (opt-in) fold the final RMSNorm into the final AttnRes (6.; patch time; not bit-identical)
+  K3STEPOV_GSPROBE=1       (diagnostic) graph-start probe: embed_bcast start/end + a stamp node, printed every
+                           K3STEPOV_GSPROBE_EVERY (512) sampled steps
+  K3STEPOV_AR_TRIM=1       (opt-in) TP16 tail AR grid (M, 8, 2) instead of (32, 8, 2) (10.; patch time);
+                           K3STEPOV_AR_TRIM_MS=1,2,...,8 = the precompiled M values
 
 1. TP-distributed Gumbel-max sampling (as step_patch): each rank runs vLLM's own
    ``gumbel_noised_argmax`` over its [M, vocab/16] logits shard with global token ids as noise
@@ -68,7 +79,12 @@ Switches (read at call time unless noted):
    error 1.6e-3 on 16 ranks).
 8. KDA metadata builders: their persistent state-index buffers alias the align context's aligned
    state indices, so the per-step staging copy (one device-to-device copy per KDA KV-cache group,
-   3 at TP16) is a no-op view copy.  Identical memory contents.
+   3 at TP16) is a no-op view copy.  Identical memory contents.  (A4: decided per builder at its first
+   build(); the old model-state latch was spent on vLLM's CUDA-graph-profiling builders.)
+9. (A4) The eager copies after sampling: sample_finish also writes sampled ids / num_sampled into pinned
+   host mirrors (AsyncOutput then issues no DtoH copies) and, with the fused num_accepted scatter,
+   the mamba align postprocess snapshot of num_accepted (its 64 B device-to-device copy is skipped).
+   Bit-identical.
 
 Everything that decides between the fast and the original path depends only on state replicated on
 all TP ranks (scheduler output, request sampling params, batch shape), so all ranks always take the
@@ -115,11 +131,52 @@ _STATE = {
     # originals
     "orig": {},
     "stats": {"dist_sample": 0, "sample_fallback": 0, "fused_post": 0, "fast_gather": 0,
-              "gather_fallback": 0, "embed_bcast": 0, "embed_fallback": 0},
+              "gather_fallback": 0, "embed_bcast": 0, "embed_fallback": 0, "state_alias": 0,
+              "state_alias_skip": 0, "host_out": 0, "snap_fused": 0, "a4_checked": 0},
     "reported": set(),
     "capture_seen": False,  # a CUDA-graph capture of the forward has started (set by the hooks)
+    "host_out": False,      # A4: async_copy_to_np patched (pinned host mirrors)
+    "snap_installed": False,  # A4: run_fused_postprocess_align transformed
+    "snap_done": None,      # A4: snapshot tensor sample_finish wrote this step
+    "a4_check": False,      # K3STEPOV_A4_CHECK=1: verify host mirrors / snapshot every step (debug)
+    "final_fold": False,    # A4: KimiLinearModel.forward transformed (final RMSNorm = final AttnRes out norm)
 }
 _EMB = {"init": None, "mb": None, "mc": 0, "rank": 0, "tp": 1, "mode": 0}
+# A2c graph-start probe (K3STEPOV_GSPROBE=1, read at patch time; diagnostic only, adds one tiny graph node):
+# embed_bcast records its start / end, a k3step.gs_stamp kernel (plain launch, i.e. the graph's 2nd node) its own start;
+# every K3STEPOV_GSPROBE_EVERY (512) sampled steps the last 64 steps are read back (one host sync) and printed.
+_GS = {"on": False, "every": 512, "gs": None, "ring": None, "n": 0, "nslots": 64}
+
+
+def _gs_buffers(dev):
+    if _GS["gs"] is None and not _capturing():
+        _GS["gs"] = torch.tensor([-1, 0], dtype=torch.int64, device=dev)  # [~0ull, 0]
+        _GS["ring"] = torch.zeros(3 * _GS["nslots"] + 1, dtype=torch.int64, device=dev)
+    return _GS["gs"], _GS["ring"]
+
+
+def gs_probe_report(force: bool = False):
+    """Read the probe ring (host sync) and print / return (2nd node start - embed end, - embed start) in us."""
+    if _GS["ring"] is None:
+        return None
+    r = _GS["ring"].cpu()
+    n = int(r[-1])
+    k = min(n, _GS["nslots"])
+    if k == 0:
+        return None
+    v = r[:-1].view(-1, 3)[:k].double()
+    ok = (v[:, 0] > 0) & (v[:, 1] > 0) & (v[:, 0] < 2**62)
+    v = v[ok]
+    if v.shape[0] == 0:
+        return None
+    d_end = ((v[:, 2] - v[:, 1]) / 1000).tolist()
+    d_start = ((v[:, 2] - v[:, 0]) / 1000).tolist()
+    res = dict(steps=n, n=len(d_end), end_med=float(np.median(d_end)), end_min=min(d_end), end_max=max(d_end),
+               start_med=float(np.median(d_start)))
+    print(f"[k3stepov] GSPROBE after {n} graph replays (last {res['n']}): 2nd graph node starts "
+          f"{res['end_med']:.2f} us (min {res['end_min']:.2f}, max {res['end_max']:.2f}) after embed_bcast ends, "
+          f"{res['start_med']:.2f} us after it starts", flush=True)
+    return res
 _PREP = {"pad": None, "idx": None, "qsl": None, "meta": {}, "installed": False, "attn_ready": None,
          "stats": {"pad_hit": 0, "pad_miss": 0, "idx_hit": 0, "idx_miss": 0, "qsl_hit": 0,
                    "qsl_miss": 0, "meta_hit": 0, "meta_miss": 0, "decode_prep": 0,
@@ -258,8 +315,10 @@ def fast_allgather(local: torch.Tensor) -> torch.Tensor:
 
 
 def sample_finish(local_max, local_arg, idx_mapping, seq_lens, cu_num_logits, prefill_len,
-                  post: dict | None = None):
-    """Cross-rank argmax + num_sampled / num_rejected (+ fused post-update if `post`)."""
+                  post: dict | None = None, snapshot=None, host=None):
+    """Cross-rank argmax + num_sampled / num_rejected (+ fused post-update if `post`; + the mamba
+    align postprocess snapshot of post["num_accepted"] into `snapshot`; + pinned host mirrors
+    `host` = (sampled i64 [M], num_sampled i32 [M]) written by the kernel)."""
     M = local_max.shape[0]
     dev = local_max.device
     sampled = torch.empty(M, dtype=torch.int64, device=dev)
@@ -268,12 +327,13 @@ def sample_finish(local_max, local_arg, idx_mapping, seq_lens, cu_num_logits, pr
     buf = _STATE["arg_call"] % NBUF
     _STATE["arg_call"] += 1
     p = post or {}
+    hs, hn = host if host is not None else (None, None)
     torch.ops.k3step.sample_finish(
         local_max, local_arg, _STATE["arg_mb"], _STATE["arg_mc"], buf, _STATE["rank"],
         _STATE["mode"], idx_mapping, seq_lens, cu_num_logits, prefill_len, sampled, num_sampled,
         num_rejected, p.get("query_start_loc"), p.get("num_computed_tokens"),
         p.get("last_sampled_tokens"), p.get("total_len"), p.get("all_token_ids"),
-        p.get("output_bin_counts"), p.get("num_accepted"), None)
+        p.get("output_bin_counts"), p.get("num_accepted"), None, snapshot, hs, hn)
     return sampled, num_sampled, num_rejected
 
 
@@ -392,11 +452,33 @@ def _sample(self, hidden_states, input_batch, grammar_output):
         logits, _STATE["rank"] * logits.shape[1], self.vocab_size,
         input_batch.expanded_idx_mapping, states.temperature.gpu, states.seeds.gpu,
         input_batch.positions, input_batch.logits_indices)
+    if _GS["on"] and _GS["ring"] is not None and not _capturing():
+        _GS["n"] += 1
+        if _GS["n"] % _GS["every"] == 0:
+            gs_probe_report()
     post, fuse_scatter = _post_args(self, input_batch)
+    snapshot = _snapshot_target(self, post) if fuse_scatter else None
+    host = None
+    if _STATE["in_sample_tokens"] and _STATE["host_out"] and not _capturing():
+        host = (torch.empty(n, dtype=torch.int64, pin_memory=True),
+                torch.empty(n, dtype=torch.int32, pin_memory=True))
     sampled, num_sampled, num_rejected = sample_finish(
         local_max, local_arg, input_batch.idx_mapping, input_batch.seq_lens,
-        input_batch.cu_num_logits, self.req_states.prefill_len.gpu, post)
+        input_batch.cu_num_logits, self.req_states.prefill_len.gpu, post, snapshot, host)
     sampled_2d = sampled.view(-1, 1)
+    if _STATE["a4_check"] and (host is not None or snapshot is not None):
+        _a4_check(n, sampled, num_sampled, host, snapshot, post)
+    _STATE["snap_done"] = snapshot  # consumed by the transformed run_fused_postprocess_align
+    _HOST.clear()
+    if host is not None:  # AsyncOutput's async_copy_to_np returns these instead of copying
+        _HOST[id(sampled_2d)] = (sampled_2d, host[0].view(-1, 1))
+        _HOST[id(num_sampled)] = (num_sampled, host[1])
+        _STATE["stats"]["host_out"] += 1
+        _report("host_out", "sampled ids / num_sampled written to pinned host memory by sample_finish "
+                            "(no DtoH copies)")
+    if snapshot is not None:
+        _STATE["stats"]["snap_fused"] += 1
+        _report("snap", "mamba align postprocess snapshot (64 B DtoD) fused into sample_finish")
     if post is not None:
         _STATE["fused"] = (sampled_2d, fuse_scatter)
         _STATE["stats"]["fused_post"] += 1
@@ -433,6 +515,8 @@ def _sample_tokens(self, grammar_output):
     finally:
         _STATE["in_sample_tokens"] = False
         _STATE["fused"] = None
+        _STATE["snap_done"] = None
+        _HOST.clear()  # AsyncOutput keeps its own references to the pinned mirrors
 
 
 class _ScatterProxy:
@@ -455,6 +539,109 @@ class _ScatterProxy:
 
     def __getattr__(self, name):
         return getattr(self._k, name)
+
+
+# ------------------------------------------------------------------------------------------
+# A4 (step-overhead lever L4): fold the eager copies after sampling into k3step.sample_finish
+#   * AsyncOutput's two DtoH copies (sampled ids, num_sampled): sample_finish writes pinned host
+#     mirrors (UVA); vllm.v1.worker.gpu.async_utils.async_copy_to_np returns them for exactly those
+#     two tensors of the current step (no copy, the copy stream only records its event after waiting
+#     for the main stream, i.e. after sample_finish).  K3STEPOV_HOST_OUT=0: off (read at patch time).
+#   * MambaSpecDecodeGPUContext.run_fused_postprocess_align's snapshot copy of the whole num_accepted
+#     buffer (64 B DtoD): sample_finish writes it after its fused num_accepted scatter; an exact-text
+#     transform of that method skips the copy_ for that snapshot tensor of that step.
+#     K3STEPOV_SNAPSHOT=0: off (read at patch time).  Both bit-identical.
+# ------------------------------------------------------------------------------------------
+_HOST: dict = {}  # id(device tensor) -> (device tensor, pinned host mirror) of the current step
+
+
+def _a4_check(n, sampled, num_sampled, host, snapshot, post):
+    """K3STEPOV_A4_CHECK=1 (debug, one host sync per step): the fused outputs must equal what the copies would give."""
+    torch.cuda.current_stream().synchronize()
+    bad = []
+    if host is not None:
+        if not torch.equal(host[0][:n], sampled[:n].cpu()):
+            bad.append(f"host sampled {host[0][:n].tolist()} vs {sampled[:n].tolist()}")
+        if not torch.equal(host[1][:n], num_sampled[:n].cpu()):
+            bad.append(f"host num_sampled {host[1][:n].tolist()} vs {num_sampled[:n].tolist()}")
+    if snapshot is not None and not torch.equal(snapshot, post["num_accepted"]):
+        bad.append("num_accepted snapshot differs")
+    _STATE["stats"]["a4_checked"] += 1
+    if bad:
+        raise RuntimeError(f"[k3stepov] A4 self-check failed (M={n}): " + "; ".join(bad))
+
+
+def _async_copy_to_np(x):
+    ent = _HOST.get(id(x))
+    if ent is not None and ent[0] is x:
+        return ent[1].numpy()
+    return _STATE["orig"]["async_copy_to_np"](x)
+
+
+def _snapshot_done(snapshot) -> bool:
+    """Called by the transformed run_fused_postprocess_align: True (skip the copy) exactly when
+    this step's sample_finish already wrote that snapshot tensor."""
+    done = _STATE["snap_done"]
+    _STATE["snap_done"] = None
+    return done is not None and done is snapshot
+
+
+def _snapshot_target(runner, post):
+    """The align context's num_accepted_tokens_out, if this step's postprocess will snapshot it."""
+    if not _STATE["snap_installed"] or post is None or post.get("num_accepted") is None:
+        return None
+    ms = runner.model_state
+    ctx = getattr(ms, "_mamba_ctx", None)
+    snap = getattr(ctx, "num_accepted_tokens_out", None)
+    na = post["num_accepted"]
+    # (recoverssm.commit_step runs between vLLM's scatter and its snapshot and gets num_accepted: keep vLLM's order)
+    if not (getattr(ms, "_align_mode", False) and getattr(ms, "recoverssm", None) is None
+            and ctx is not None and getattr(ctx, "is_initialized", False)
+            and isinstance(snap, torch.Tensor) and snap.dtype == torch.int32 and snap.is_contiguous()
+            and snap.device == na.device and snap.numel() == na.numel()):
+        return None
+    return snap
+
+
+SNAP_OLD = ["num_accepted_tokens_snapshot = self.num_accepted_tokens_out",
+            "num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)"]
+SNAP_NEW = ["num_accepted_tokens_snapshot = self.num_accepted_tokens_out",
+            "if not _k3sov_snapshot_done(num_accepted_tokens_snapshot):",
+            "    num_accepted_tokens_snapshot.copy_(num_accepted_tokens_gpu)"]
+
+
+def _install_host_out_and_snapshot() -> None:
+    if _on("K3STEPOV_HOST_OUT", "0") and "async_copy_to_np" not in _STATE["orig"]:
+        try:
+            from vllm.v1.worker.gpu import async_utils as au
+
+            _STATE["orig"]["async_copy_to_np"] = au.async_copy_to_np
+            au.async_copy_to_np = _async_copy_to_np
+            _STATE["host_out"] = True
+        except Exception as e:  # noqa: BLE001
+            print(f"[k3stepov] host-mirror output unavailable ({e!r})", flush=True)
+    if _on("K3STEPOV_SNAPSHOT", "0") and not _STATE["snap_installed"]:
+        try:
+            from vllm.v1.worker import mamba_utils as mu
+
+            cls = mu.MambaSpecDecodeGPUContext
+            fn = cls.run_fused_postprocess_align
+            src = textwrap.dedent(inspect.getsource(fn))
+            new_src, ok = _replace_lines(src, SNAP_OLD, SNAP_NEW)
+            if not ok:
+                print("[k3stepov] run_fused_postprocess_align text differs: snapshot copy not fused",
+                      flush=True)
+                return
+            mu.__dict__["_k3sov_snapshot_done"] = _snapshot_done
+            ns: dict = {}
+            exec(compile(new_src, mu.__file__, "exec"), mu.__dict__, ns)
+            newfn = ns["run_fused_postprocess_align"]
+            newfn.__qualname__ = fn.__qualname__
+            _STATE["orig"]["run_fused_postprocess_align"] = fn
+            cls.run_fused_postprocess_align = newfn
+            _STATE["snap_installed"] = True
+        except Exception as e:  # noqa: BLE001
+            print(f"[k3stepov] snapshot fusion unavailable ({e!r})", flush=True)
 
 
 def _install_sampling() -> None:
@@ -491,6 +678,7 @@ def _install_sampling() -> None:
             _STATE["mamba_postprocess"] = vars(cls)["postprocess_state"]
     except Exception as e:  # noqa: BLE001
         print(f"[k3stepov] mamba num_accepted fusion unavailable ({e!r})", flush=True)
+    _install_host_out_and_snapshot()
 
 
 # ==========================================================================================
@@ -612,7 +800,7 @@ def _k3sov_decode_prep(runner, idx_mapping, query_start_loc, cu_num_logits, tota
         return None
     rs, ib = runner.req_states, runner.input_buffers
     li = torch.empty(total_num_logits, dtype=torch.int64, device=idx_mapping.device)
-    if (_on("K3STEPOV_PREP_ATTN") and hasattr(torch.ops.k3step, "decode_prep_attn")
+    if ("prepare_attn" in _STATE["orig"] and hasattr(torch.ops.k3step, "decode_prep_attn")
             and num_reqs_padded is not None and num_tokens_after_padding is not None
             and num_reqs_padded >= idx_mapping.shape[0] and num_reqs_padded <= ib.seq_lens.shape[0]
             and _bt_layout_ok(runner, num_tokens_after_padding)):
@@ -729,8 +917,9 @@ def _install_prepare_inputs() -> bool:
     newfn.__doc__ = fn.__doc__
     _STATE["orig"]["prepare_inputs"] = fn
     mr.GPUModelRunner.prepare_inputs = newfn
-    _STATE["orig"]["prepare_attn"] = mr.GPUModelRunner.prepare_attn
-    mr.GPUModelRunner.prepare_attn = _prepare_attn
+    if _on("K3STEPOV_PREP_ATTN"):
+        _STATE["orig"]["prepare_attn"] = mr.GPUModelRunner.prepare_attn
+        mr.GPUModelRunner.prepare_attn = _prepare_attn
     _PREP["installed"] = True
     return True
 
@@ -823,8 +1012,13 @@ def _embed_input_ids(self, input_ids):
         return orig(self, input_ids)
     w = et.weight
     out = torch.empty((input_ids.shape[0], w.shape[1]), dtype=w.dtype, device=w.device)
+    gs = ring = None
+    if _GS["on"]:
+        gs, ring = _gs_buffers(w.device)
     torch.ops.k3step.embed_bcast(input_ids, w, et.org_vocab_size, _EMB["rank"], _EMB["mb"],
-                                 _EMB["mc"], _EMB["mode"], out)
+                                 _EMB["mc"], _EMB["mode"], out, gs)
+    if gs is not None:
+        torch.ops.k3step.gs_stamp(gs, ring)
     _STATE["stats"]["embed_bcast"] += 1
     _report("embed", "NVLS embedding broadcast active (M<=16)")
     return out
@@ -982,8 +1176,10 @@ def _install_final_norm() -> None:
             ok = False
         if m is not None:
             m._k3sov_final_norm = bool(ok)
+            m._k3sov_final_fold = bool(ok) and _STATE["final_fold"]
         if ok:
-            _report("final_norm", "final RMSNorm moved into the model forward (CUDA graph)")
+            _report("final_norm", "final RMSNorm moved into the model forward (CUDA graph)"
+                    + (", folded into the final AttnRes (K3STEPOV_FINAL_FOLD)" if _STATE["final_fold"] else ""))
 
     CausalLM.__init__ = __init__
     _STATE["orig"]["final_norm_init"] = orig_init
@@ -1003,16 +1199,66 @@ def _install_final_norm() -> None:
     if pf is not None and pf._STATE.get("patched") and pf._STATE.get("orig_model_forward"):
         # inside l2pf's wrapper, i.e. before its side-stream join: the norm runs in the prefetch
         # window
-        pf._STATE["orig_model_forward"] = _final_norm_wrap(pf._STATE["orig_model_forward"])
+        pf._STATE["orig_model_forward"] = _final_norm_wrap(_final_fold_transform(pf._STATE["orig_model_forward"]))
     else:
-        Model.forward = _final_norm_wrap(Model.forward)
+        Model.forward = _final_norm_wrap(_final_fold_transform(Model.forward))
+
+
+# A4 (step-overhead lever L7, opt-in K3STEPOV_FINAL_FOLD=1, read at patch time): the final RMSNorm is folded into the
+# model's final AttnRes call as its output norm (k3tail.lamport_attn_res's OUT_NORM path, or vLLM's attn_res with an
+# output norm on its fallback path): one kernel (vllm::rms_norm_kernel, ~3.4 us/step) less.  NOT bit-identical: the
+# fused norm uses the fp32 mix instead of bf16(mix) (the algebra of every layer's pre-attention norm); see
+# test_final_fold.py for the measured difference.
+FOLD_OLD = ["self.output_attn_res_proj.weight.squeeze(0),", "None,", "num_blocks=self.num_attn_res_blocks,",
+            "block_write_idx=-1,", "eps=self.output_attn_res_norm.variance_epsilon,", "output_norm_eps=0.0,"]
+FOLD_NEW = ["self.output_attn_res_proj.weight.squeeze(0),",
+            "self.norm.weight if getattr(self, '_k3sov_final_fold', False) else None,",
+            "num_blocks=self.num_attn_res_blocks,", "block_write_idx=-1,",
+            "eps=self.output_attn_res_norm.variance_epsilon,",
+            "output_norm_eps=self.norm.variance_epsilon if getattr(self, '_k3sov_final_fold', False) else 0.0,"]
+
+
+def transform_final_fold_source(src: str) -> tuple[str, bool]:
+    return _replace_lines(src, FOLD_OLD, FOLD_NEW)
+
+
+def _final_fold_transform(fn):
+    """KimiLinearModel.forward with the final AttnRes taking model.norm as its output norm when the model is
+    flagged (_k3sov_final_fold); the original function if the switch is off or vLLM's text differs."""
+    if not _on("K3STEPOV_FINAL_FOLD", "0"):
+        return fn
+    try:
+        from vllm.models.kimi_k3.nvidia import model as k3_model
+
+        # only vLLM's own function: inspect.getsource unwraps functools.wraps wrappers, and rebuilding from the
+        # unwrapped source would silently drop another patch's wrapper
+        if (hasattr(fn, "__wrapped__") or getattr(fn, "__code__", None) is None
+                or fn.__code__.co_filename != k3_model.__file__ or fn.__qualname__ != "KimiLinearModel.forward"):
+            print("[k3stepov] KimiLinearModel.forward is already wrapped: final RMSNorm not folded", flush=True)
+            return fn
+        new_src, ok = transform_final_fold_source(textwrap.dedent(inspect.getsource(fn)))
+        if not ok:
+            print("[k3stepov] KimiLinearModel.forward text differs: final RMSNorm not folded", flush=True)
+            return fn
+        ns: dict = {}
+        exec(compile(new_src, k3_model.__file__, "exec"), k3_model.__dict__, ns)
+        new = ns[fn.__name__]
+        new.__qualname__ = fn.__qualname__
+        new.__module__ = fn.__module__
+        new.__doc__ = fn.__doc__
+        _STATE["final_fold"] = True
+        return new
+    except Exception as e:  # noqa: BLE001
+        print(f"[k3stepov] final RMSNorm fold unavailable ({e!r})", flush=True)
+        return fn
 
 
 def _final_norm_wrap(inner):
     @functools.wraps(inner)
     def forward(self, *args, **kwargs):
+        fold = getattr(self, "_k3sov_final_fold", False)  # set at construction (read by the transformed forward)
         out = inner(self, *args, **kwargs)
-        if getattr(self, "_k3sov_final_norm", False) and isinstance(out, torch.Tensor):
+        if getattr(self, "_k3sov_final_norm", False) and not fold and isinstance(out, torch.Tensor):
             out = self.norm(out, None)
         return out
 
@@ -1064,20 +1310,20 @@ def install_local_l0_for_tests(mb, mc, rank, tp):
 
 
 def _l0_mlp_forward(self, x):
-    """KimiMLP.forward of the flagged dense layer: return the down_proj partial (no all-reduce);
-    the next layer's _pre_attn_norm reduces it inside k3ar.ar_attn_res."""
-    orig = _STATE["orig"]["mlp_forward"]
+    """Instance-level forward of the flagged dense KimiMLP (layer 0): return the down_proj partial
+    (no all-reduce); layer 1's _pre_attn_norm reduces it inside k3ar.ar_attn_res."""
     _L0["pending"] = None
-    if not (getattr(self, "_k3sov_l0", False) and _on("K3STEPOV_L0FUSE", "0")
-            and isinstance(x, torch.Tensor) and x.dim() == 2 and 1 <= x.shape[0] <= MAX_M
-            and x.dtype == torch.bfloat16 and not torch.compiler.is_compiling()):
-        return orig(self, x)
+    cls_forward = type(self).forward
+    if not (_on("K3STEPOV_L0FUSE", "0") and isinstance(x, torch.Tensor) and x.dim() == 2
+            and 1 <= x.shape[0] <= MAX_M and x.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()):
+        return cls_forward(self, x)
     if _L0["init"] is None:
         if _capturing():
-            return orig(self, x)
+            return cls_forward(self, x)
         _l0_init(x.device)
     if not _L0["init"]:
-        return orig(self, x)
+        return cls_forward(self, x)
     gate_up, _ = self.gate_up_proj(x)
     y = self.act_fn(gate_up)
     dp = self.down_proj
@@ -1096,18 +1342,19 @@ def _l0_mlp_forward(self, x):
 
 
 def _l1_pre_attn_norm(self, hidden_states, residual, prefix_sum):
+    """Instance-level _pre_attn_norm of layer 1 (the class method -- tailattn's, which other patches
+    identify by identity -- is left untouched and called for everything but the fused case)."""
+    cls_pre = type(self)._pre_attn_norm
     p = _L0["pending"]
     if p is None or hidden_states is not p:
-        return _STATE["orig"]["pre_attn_norm"](self, hidden_states, residual, prefix_sum)
+        return cls_pre(self, hidden_states, residual, prefix_sum)
     _L0["pending"] = None
-    if not (getattr(self, "_k3sov_l1", False) and prefix_sum is not None and residual is not None
-            and prefix_sum.stride(0) == 7168 and residual.stride(-1) == 1
-            and 0 <= self.prev_valid_blocks <= 8):
+    if not (prefix_sum is not None and residual is not None and prefix_sum.stride(0) == 7168
+            and residual.stride(-1) == 1 and 0 <= self.prev_valid_blocks <= 8):
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         _L0["stats"]["fallback"] += 1
-        return _STATE["orig"]["pre_attn_norm"](self, tensor_model_parallel_all_reduce(p), residual,
-                                               prefix_sum)
+        return cls_pre(self, tensor_model_parallel_all_reduce(p), residual, prefix_sum)
     out = torch.empty_like(p)
     torch.ops.k3ar.ar_attn_res(
         p, _L0["mb"], _L0["mc"], 0, _L0["rank"], _L0["tp"], prefix_sum, True, residual,
@@ -1123,16 +1370,19 @@ def _l1_pre_attn_norm(self, hidden_states, residual, prefix_sum):
 def _install_l0_fuse() -> None:
     """Flags (at model construction) the dense layer 0 -> layer 1 pair when: TP > 1, AttnRes, layer 0
     is a plain KimiMLP (TP-sharded down_proj with reduce_results, no sequence parallel, no GEMM-RS-AR)
-    and nothing reads layer 0's output except layer 1 (no aux hidden-state layers).  One k3ar call per
+    and nothing reads layer 0's output except layer 1 (no aux hidden-state layers).  The overrides are
+    INSTANCE attributes of those two modules only (layer 0's mlp.forward, layer 1's _pre_attn_norm):
+    the class methods -- which tailattn identifies by identity -- stay untouched.  One k3ar call per
     forward uses mailbox buffer 0 only: consecutive calls are separated by the forward's other
     collectives.  Numerics: fp32 sum of the 16 partials in rank order, one bf16 rounding, then
-    AttnRes (the K3OPT_ARRES kernel); not bit-identical to flashinfer's all-reduce + vLLM's AttnRes
-    kernel.  K3STEPOV_L0FUSE=0: original path."""
+    AttnRes (the K3OPT_ARRES kernel); not bit-identical to flashinfer's all-reduce + vLLM's AttnRes."""
+    import types as _types
+
     from vllm.models.kimi_k3.nvidia import model as k3_model
 
-    if "mlp_forward" in _STATE["orig"]:
+    if "l0_model_init" in _STATE["orig"]:
         return
-    Model, Layer, MLP = k3_model.KimiLinearModel, k3_model.KimiDecoderLayer, k3_model.KimiMLP
+    Model, MLP = k3_model.KimiLinearModel, k3_model.KimiMLP
     orig_init = Model.__init__
 
     @functools.wraps(orig_init)
@@ -1155,64 +1405,107 @@ def _install_l0_fuse() -> None:
                   and getattr(l1, "use_attn_res", False) and getattr(l0, "use_attn_res", False)
                   and getattr(dp, "output_size", 7168) == 7168)
             if ok:
-                mlp._k3sov_l0 = True
-                l1._k3sov_l1 = True
+                mlp.forward = _types.MethodType(_l0_mlp_forward, mlp)
+                l1._pre_attn_norm = _types.MethodType(_l1_pre_attn_norm, l1)
+                print("[k3stepov] layer-0 AR+AttnRes fusion installed on layers "
+                      f"{start}->{start + 1} (instance overrides)", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"[k3stepov] layer-0 fusion not installed: {e!r}", flush=True)
 
     Model.__init__ = __init__
     _STATE["orig"]["l0_model_init"] = orig_init
-    _STATE["orig"]["mlp_forward"] = MLP.forward
-    MLP.forward = _l0_mlp_forward
-    _STATE["orig"]["pre_attn_norm"] = Layer._pre_attn_norm
-    Layer._pre_attn_norm = _l1_pre_attn_norm
 
 
 # ==========================================================================================
-# 8. KDA state-index staging: alias the builders' persistent buffers to the aligned indices
+# 8. KDA state-index staging: alias each builder's persistent buffer to the aligned indices
 # ==========================================================================================
-def _alias_state_indices(ms, attn_groups, kv_cache_config, block_tables) -> None:
-    """Once per model state, before any CUDA graph is captured: point every KDA metadata builder's
-    persistent ``non_spec_state_indices_tensor`` at its row of the align context's
-    ``aligned_state_indices`` [groups, max_reqs, 1] (which get_aligned_state_indices_multi_group
-    writes every step).  The builder's per-step ``copy_`` from that row into its buffer then copies
-    a view onto itself, which PyTorch skips (no kernel): one device-to-device copy per KDA group and
-    step disappears.  Same memory contents at every point the forward reads them."""
-    if getattr(ms, "_k3sov_alias", None) is not None:
-        return
+def _alias_builder(b) -> bool:
+    """At the FIRST build() of a KDA metadata builder (before any CUDA graph can have captured its buffer: the buffer
+    only reaches the forward through the metadata build() returns) point its persistent
+    ``non_spec_state_indices_tensor`` at the row of the align context's ``aligned_state_indices`` [groups, max_reqs, 1]
+    that its per-step staging copy reads (``mamba_aligned_state_indices``, set by MambaHybridModelState.prepare_attn
+    just before).  The copy then copies a view onto itself, which PyTorch skips (no kernel).  Decided once per builder
+    object, so the throwaway builders + align context of vLLM's CUDA-graph memory profiling
+    (cudagraph_utils._init_minimal_kv_cache_for_profiling / _teardown_profiling_state) no longer consume the alias
+    (stepov <= e72f10bc latched it on the model state there: the real builders were never aliased in-server).
+    A later step whose indices live elsewhere (a re-created align context) simply copies again: correct, no gain."""
+    ok = getattr(b, "_k3sov_alias", None)
+    if ok is not None:
+        return ok
     ok = False
+    why = "?"
     try:
-        if (_on("K3STEPOV_STATE_ALIAS") and not _STATE["capture_seen"] and not _capturing()
-                and getattr(ms, "_align_mode", False) and block_tables is not None):
-            group_ids, _ = ms._get_mamba_group_info(kv_cache_config)
-            ctx = ms._ensure_align_ctx(kv_cache_config, group_ids, block_tables)
-            al = getattr(ctx, "aligned_state_indices", None)
-            if isinstance(al, torch.Tensor) and al.dim() == 3 and al.shape[2] == 1 and al.is_contiguous():
-                n = 0
-                for gi, gid in enumerate(group_ids):
-                    for group in attn_groups[gid]:
-                        b = group.get_metadata_builder(0)
-                        buf = getattr(b, "non_spec_state_indices_tensor", None)
-                        if (not hasattr(b, "mamba_aligned_state_indices") or not isinstance(buf, torch.Tensor)
-                                or buf.dim() != 1 or buf.dtype != al.dtype or buf.device != al.device
-                                or buf.shape[0] > al.shape[1]):
-                            continue
-                        b.non_spec_state_indices_tensor = al[gi, : buf.shape[0], 0]
-                        n += 1
-                ok = n > 0
-                if ok:
-                    print(f"[k3stepov] KDA state-index staging aliased for {n} group builder(s): "
-                          f"no per-step device-to-device copies", flush=True)
+        mai = getattr(b, "mamba_aligned_state_indices", None)
+        buf = getattr(b, "non_spec_state_indices_tensor", None)
+        base = getattr(mai, "_base", None) if isinstance(mai, torch.Tensor) else None
+        if not _on("K3STEPOV_STATE_ALIAS"):
+            why = "K3STEPOV_STATE_ALIAS=0"
+        elif not isinstance(mai, torch.Tensor):
+            why = "no mamba_aligned_state_indices at the first build"
+        elif not isinstance(base, torch.Tensor):
+            why = "mamba_aligned_state_indices is not a view"
+        elif not isinstance(buf, torch.Tensor) or buf.dim() != 1:
+            why = "no 1-D non_spec_state_indices_tensor"
+        elif not (base.dim() == 3 and mai.dim() == 2 and buf.dtype == base.dtype == mai.dtype
+                  and buf.device == base.device and mai.stride() == base.stride()[1:]):
+            why = (f"layout base {tuple(base.shape)}/{base.dtype} mai {tuple(mai.shape)}/{mai.stride()} "
+                   f"buf {tuple(buf.shape)}/{buf.dtype}")
+        elif not 0 < buf.shape[0] <= base.shape[1]:
+            why = f"buffer rows {buf.shape[0]} > aligned rows {base.shape[1]}"
+        else:
+            gi, rem = divmod(mai.storage_offset() - base.storage_offset(), base.stride(0))
+            if rem == 0 and 0 <= gi < base.shape[0]:
+                b.non_spec_state_indices_tensor = base[gi, : buf.shape[0], 0]
+                ok = True
+            else:
+                why = f"offset {mai.storage_offset() - base.storage_offset()} not a group row"
     except Exception as e:  # noqa: BLE001
-        print(f"[k3stepov] state-index alias not installed: {e!r}", flush=True)
+        why = repr(e)
         ok = False
-    ms._k3sov_alias = ok
+    b._k3sov_alias = ok
+    _STATE["stats"]["state_alias" if ok else "state_alias_skip"] += 1
+    if ok:
+        _report("alias_ok", "KDA state-index staging aliased on the builders' first build: "
+                            "no per-step device-to-device copies")
+    else:
+        _report("alias_skip", f"KDA state-index alias NOT applied to a builder: {why}")
+    return ok
+
+
+def _wrap_kda_builder_class() -> bool:
+    """Wrap KimiK3KDAMetadataBuilder.build (idempotent).  False if the class cannot be imported yet."""
+    if "state_alias_build" in _STATE["orig"]:
+        return True
+    try:
+        from vllm.models.kimi_k3.nvidia.kda_metadata import KimiK3KDAMetadataBuilder as B
+    except Exception as e:  # noqa: BLE001
+        _STATE["alias_import_err"] = repr(e)
+        return False
+    orig = B.build
+
+    @functools.wraps(orig)
+    def build(self, *args, **kwargs):
+        if getattr(self, "_k3sov_alias", None) is None:
+            _alias_builder(self)
+        return orig(self, *args, **kwargs)
+
+    _STATE["orig"]["state_alias_build"] = orig
+    B.build = build
+    print("[k3stepov] state-index alias: KimiK3KDAMetadataBuilder.build wrapped (per-builder alias at first build)",
+          flush=True)
+    return True
 
 
 def _install_state_alias() -> None:
+    """The KDA builder class may not be importable while vLLM loads plugins (the s_a4 run never printed an alias line):
+    then the wrapper is installed at the first MambaHybridModelState.prepare_attn call, which precedes every
+    builder's first build (builders are only built inside prepare_attn)."""
+    if _wrap_kda_builder_class():
+        return
     try:
         from vllm.v1.worker.gpu.model_states import mamba_hybrid as mh
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        print(f"[k3stepov] state-index alias unavailable ({_STATE.get('alias_import_err')}; {e!r})", flush=True)
         return
     cls = getattr(mh, "MambaHybridModelState", None)
     if cls is None or "state_alias_prepare_attn" in _STATE["orig"]:
@@ -1220,14 +1513,90 @@ def _install_state_alias() -> None:
     orig = cls.prepare_attn
 
     @functools.wraps(orig)
-    def prepare_attn(self, input_batch, cudagraph_mode, block_tables, slot_mappings, attn_groups,
-                     kv_cache_config, *args, **kwargs):
-        _alias_state_indices(self, attn_groups, kv_cache_config, block_tables)
-        return orig(self, input_batch, cudagraph_mode, block_tables, slot_mappings, attn_groups,
-                    kv_cache_config, *args, **kwargs)
+    def prepare_attn(self, *args, **kwargs):
+        if "state_alias_build" not in _STATE["orig"] and not _wrap_kda_builder_class():
+            _report("alias_imp", f"state-index alias: KDA builder class not importable "
+                                 f"({_STATE.get('alias_import_err')})")
+        return orig(self, *args, **kwargs)
 
     _STATE["orig"]["state_alias_prepare_attn"] = orig
     cls.prepare_attn = prepare_attn
+    print(f"[k3stepov] state-index alias: builder class not importable at patch time "
+          f"({_STATE.get('alias_import_err')}); wrapping it at the first prepare_attn", flush=True)
+
+
+# ==========================================================================================
+# 10. (A4, opt-in K3STEPOV_AR_TRIM=1, read at patch time) TP16 latent-MoE tail AR grid trim
+# ==========================================================================================
+# vLLM launches the tail AllReduce+RMSNorm+ReduceScatter (allreduce_rmsnorm_reduce_scatter_early_exit, TP16) with grid
+# (token_ctas = 32, 8, 2) = 512 CTAs x 56 threads x 214 regs for every M <= 32; CTAs with token_cta >= M only run
+# griddepcontrol.wait and exit, but they hold SM slots (4 CTAs/SM by registers: ~128 SMs) until the MoE before them
+# completes.  With max_token_ctas = M the grid is (M, 8, 2): each token CTA does exactly the work it does today (the
+# token loop runs once, parity 0; the Lamport buffer flip -- token_cta 0, token + token_ctas >= m, waits for m
+# arrivals -- and the clear ranges depend on m, not on the grid), so results and protocol are unchanged.
+# Specialisations for K3STEPOV_AR_TRIM_MS (default 1..8) are compiled in CollectiveKernel.__init__ (~1 s each); a
+# launch is trimmed only if its specialisation is already compiled (never compiles during a capture).
+_AR = {"ms": (), "stats": {"ar_trimmed": 0, "ar_default": 0}}
+
+
+def _ar_launch(*args, **kwargs):
+    import vllm.models.kimi_k3.nvidia.ops.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit as ar
+
+    orig = _STATE["orig"]["ar_launch"]
+    try:
+        m = int(args[6].shape[0])  # shared_source [m, hidden] (validated by CollectiveKernel.__call__)
+        tok = kwargs["max_token_ctas"]
+        if (kwargs["tp_size"] == 16 and m in _AR["ms"] and m < tok and kwargs.get("include_reduce_scatter", True)
+                and kwargs.get("include_routed", True)):
+            key = ar._compile_key(kwargs["rank"], kwargs["tp_size"], kwargs["latent_dim"], kwargs["hidden_dim"],
+                                  kwargs["max_m"], m, kwargs["fp32_internal"], True, True,
+                                  top_k=kwargs.get("top_k", 0))
+            if key in ar._COMPILED:
+                _AR["stats"]["ar_trimmed"] += 1
+                _report("ar_trim", "TP16 tail AR grid trimmed to (M, 8, 2)")
+                return orig(*args, **{**kwargs, "max_token_ctas": m})
+    except Exception:  # noqa: BLE001
+        pass
+    _AR["stats"]["ar_default"] += 1
+    return orig(*args, **kwargs)
+
+
+def _install_ar_trim() -> None:
+    if not _on("K3STEPOV_AR_TRIM", "0") or "ar_launch" in _STATE["orig"]:
+        return
+    try:
+        import vllm.models.kimi_k3.nvidia.ops.cute_dsl.latent_moe_tail.allreduce_rmsnorm_reduce_scatter_early_exit as ar
+    except Exception as e:  # noqa: BLE001
+        print(f"[k3stepov] tail AR trim unavailable ({e!r})", flush=True)
+        return
+    try:
+        _AR["ms"] = tuple(sorted({int(x) for x in os.environ.get("K3STEPOV_AR_TRIM_MS", "1,2,3,4,5,6,7,8").split(",")
+                                  if x.strip()}))
+    except ValueError:
+        _AR["ms"] = tuple(range(1, 9))
+    cls = ar.CollectiveKernel
+    orig_init = cls.__init__
+
+    @functools.wraps(orig_init)
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        if self.tp_size != 16 or getattr(self, "_seven_cta_max_m", 0):
+            return
+        for m in _AR["ms"]:
+            if 1 <= m <= self.max_m and m < self.max_token_ctas:
+                ar.compile_kernel(rank=self.rank, tp_size=self.tp_size, latent_dim=self.latent_dim,
+                                  hidden_dim=self.hidden_dim, max_m=self.max_m, max_token_ctas=m,
+                                  latent_output=self._latent_output, routed_workspace=self._routed_workspace,
+                                  routed_flags=self._routed_flags, routed_multicast_ptr=self._routed_multicast_ptr,
+                                  shared_output=self._shared_output, shared_workspace=self._shared_workspace,
+                                  shared_flags=self._shared_flags, shared_peer_ptrs=self._shared_peer_ptrs,
+                                  rms_eps=self.rms_eps, fp32_internal=self.fp32_internal, top_k=self.top_k)
+        print(f"[k3stepov] tail AR grid trim: specialisations max_token_ctas in {list(_AR['ms'])} compiled", flush=True)
+
+    cls.__init__ = __init__
+    _STATE["orig"]["ar_init"] = orig_init
+    _STATE["orig"]["ar_launch"] = ar.launch
+    ar.launch = _ar_launch  # CollectiveKernel.__call__ calls the module global
 
 
 # ==========================================================================================
@@ -1244,13 +1613,19 @@ def patch_stepov(load_ext) -> bool:
     prep = _install_prepare_inputs()
     _install_embed()
     _install_lmhead_prefetch()
-    _install_final_norm()
-    # Install only when enabled: the wrapper replaces KimiDecoderLayer._pre_attn_norm, and tailattn
-    # defers a MoE tail only if that method is still its own (identity check) -- an always-installed
-    # pass-through wrapper silently disabled 91 of 92 tail hand-offs (+0.17-0.25 ms/step).
+    # Optional features: install only when enabled (read at patch time), and never replace a method
+    # another patch identifies by identity (tailattn checks KimiDecoderLayer._pre_attn_norm): an
+    # always-installed pass-through wrapper once disabled 91 of 92 tail hand-offs (+0.17-0.25 ms/step).
+    if _on("K3STEPOV_FINAL_NORM"):
+        _install_final_norm()
     if _on("K3STEPOV_L0FUSE", "0"):
         _install_l0_fuse()
-    _install_state_alias()
+    if _on("K3STEPOV_STATE_ALIAS"):
+        _install_state_alias()
+    _install_ar_trim()
+    _STATE["a4_check"] = _on("K3STEPOV_A4_CHECK", "0")
+    _GS["on"] = _on("K3STEPOV_GSPROBE", "0")
+    _GS["every"] = max(1, _env_int("K3STEPOV_GSPROBE_EVERY", 512))
     _STATE["patched"] = True
     print("[k3stepov] patched: distributed sampling + fused post-update, "
           f"input-prep caching {'on' if prep else 'OFF'}, embedding broadcast, lm_head prefetch "
@@ -1259,4 +1634,5 @@ def patch_stepov(load_ext) -> bool:
 
 
 def stats() -> dict:
-    return {**_STATE["stats"], **_PREP["stats"], **{"l0_" + k: v for k, v in _L0["stats"].items()}}
+    return {**_STATE["stats"], **_PREP["stats"], **{"l0_" + k: v for k, v in _L0["stats"].items()},
+            **_AR["stats"]}
