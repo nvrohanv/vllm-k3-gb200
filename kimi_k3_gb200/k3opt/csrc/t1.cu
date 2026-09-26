@@ -35,8 +35,9 @@
 //           rows are ONE contiguous 64-B run (NC=14: 2 writers per H4 line), stored as 4 lanes x 16 B multimem.st.
 //   re-arm  RS chunks by their reader after the publish; latent columns by the last of the NC readers
 //           (readers-done counter cnt[par*8 + q], relaxed atom); optional next-layer prefetch issue (pf_mode 2).
-// Kernel instantiations t1_kernel<NC, KM>: KM = 1 / 2 compile-time token count (the hot paths: no loops, no runtime
-// division; cold instruction fetch of branchy code dominated v1's time), 0 = runtime M 3..8.
+// Kernel instantiations t1_kernel<NC, KM>: KM = 1 (M = 1); KM = 2 (M = 2..4 as TOKEN SETS of 2: at M = 3 / 4 the grid is
+// two sets of NC clusters, set g handling tokens [2 g, +2) -- one poll round, one xn round, one GEMV pass, every CTA
+// still LIGHT; v6); KM = 0 = runtime M 5..8 (rounds of 2 tokens). Front-mode line tasks spread over ALL CTAs.
 // Build knobs (experiments only): T1_DIAG (extra trace marks), T1_NOTMA, T1_POLL_NS, T1_POLL_LD, T1_FRONT_FENCE,
 // T1_EXIT_BARRIER, T1_NT (the kernel assumes 128). Runtime env: K3T1_NC, K3T1_TRIG, K3T1_POLL_DELAY_NS, K3T1_CARVEOUT.
 #include <torch/all.h>
@@ -345,8 +346,14 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   const unsigned long long t_entry = gtimer();
   extern __shared__ __align__(128) uint8_t sm[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const int gb = blockIdx.x, c = gb / kCl;
-  const int M = KM ? KM : a.M;
+  const int gb = blockIdx.x;
+  // TOKEN SPLIT (v6): KM = 2 serves M = 2..4 as ceil(M / 2) independent sets of NC clusters, set g handling tokens
+  // [2 g, 2 g + 2) with the M <= 2 code path (one poll round, one xn round, one GEMV pass at M = 3 / 4).
+  const int ccl = gb / kCl;                          // cluster index in the grid
+  const int grp = KM == 2 ? ccl / NC : 0;            // token set
+  const int c = ccl - grp * NC;                      // row cluster within the set
+  const int gt0 = 2 * grp;                           // first token of the set
+  const int M = KM == 1 ? 1 : KM == 2 ? min(2, a.M - gt0) : a.M;  // tokens of this CTA (runtime 1..2 for KM = 2)
   uint32_t q;
   asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(q));
   // rows of this cluster: 56 8-row groups over NC clusters (NC=14: 32 rows each; NC=15: 11 x 32 + 4 x 24)
@@ -415,13 +422,13 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   if (a.gemm2 != nullptr) {
     asm volatile("griddepcontrol.wait;" ::: "memory");  // gemm2 / wts / shared_out come from the predecessor
     T1_MARK(9)
-    constexpr int G = kCl * NC;
-    // Tasks = whole 128-B lines: M * 56 latent lines (finalize) then M * 112 shared-out lines (RS copies); task
+    const int G = gridDim.x, Ma = a.M;  // ALL tokens over ALL CTAs (token sets included)
+    // Tasks = whole 128-B lines: Ma * 56 latent lines (finalize) then Ma * 112 shared-out lines (RS copies); task
     // -> CTA task % G, warp task / G (warp-uniform). Each line is written by ONE warp: 8 lanes x 16 B.
-    const int ntask = M * (kLpt + kRpt);
+    const int ntask = Ma * (kLpt + kRpt);
 #pragma unroll 1
     for (int task = gb + G * warp; task < ntask; task += G * (kNT / 32)) {
-      if (task < M * kLpt) {
+      if (task < Ma * kLpt) {
         const int t = task / kLpt, L = task - t * kLpt;
         // lane: columns 64 L + 2 lane, +1; vLLM finalize_top16_bf16 per column (fp32 FMA over slots 0..15 in order,
         // one bf16 rounding), identical to the per-column arithmetic of every earlier version
@@ -456,7 +463,7 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
         }
 #endif
       } else if (lane < 8) {  // shared-out line -> the owner rank's RS mailbox (7 whole lines per 448-column shard)
-        const int u = task - M * kLpt, t = u / kRpt, Ls = u - t * kRpt;
+        const int u = task - Ma * kLpt, t = u / kRpt, Ls = u - t * kRpt;
         const int d = Ls / 7, cl = Ls - 7 * d;
         const uint4 v = no_neg_zero4(*reinterpret_cast<const uint4*>(a.sh + static_cast<long>(t) * kHid + 64 * Ls + 8 * lane));
         st_mb16(a.rs_peer[d] + static_cast<unsigned long long>(
@@ -486,8 +493,10 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
     const int jj = KM == 1 ? tid - 64 : pk - kFrag;
     if (jj >= 0 && jj < nrs) rs_j = jj;
   }
+  const int nrounds = KM ? 1 : (M + 1) / 2;
 #pragma unroll 1
-  for (int t0 = 0; t0 < M; t0 += 2) {
+  for (int rr = 0; rr < nrounds; ++rr) {
+    const int t0 = 2 * rr;
     const int t_ = t0 + pt;
     const bool lat_th = t_ < M && pk < kFrag;
     const bool rs_th = rs_j >= 0 && (KM == 1 ? t0 == 0 : t_ < M);
@@ -495,8 +504,8 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
     float s2 = 0.f;
     if (lat_th || rs_th) {
       // one code path for latent and RS readers (no divergence in the poll)
-      const uint4* base = lat_th ? reinterpret_cast<const uint4*>(a.lat_mb + (lat_par + t) * kLat + kCols * q + 8 * pk)
-                                 : reinterpret_cast<const uint4*>(a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + t) *
+      const uint4* base = lat_th ? reinterpret_cast<const uint4*>(a.lat_mb + (lat_par + gt0 + t) * kLat + kCols * q + 8 * pk)
+                                 : reinterpret_cast<const uint4*>(a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + gt0 + t) *
                                                                                 kShard + row0 + 8 * rs_j);
       const long ss = lat_th ? lss : rss;
       uint4 v[kTp];
@@ -552,8 +561,8 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   T1_MARK(3)
   mbar_wait(bg, 0);  // landed long ago
 #pragma unroll 1
-  for (int t0 = 0; t0 < M; t0 += 2) {  // xn of this CTA's own columns, in place
-    const int t = t0 + pt;
+  for (int rr = 0; rr < nrounds; ++rr) {  // xn of this CTA's own columns, in place
+    const int t = 2 * rr + pt;
     if (t < M && pk < kFrag) {
       float tot = 0.f;
 #pragma unroll
@@ -581,8 +590,11 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   if (warp * 8 < nrows) {
     if constexpr (KM == 1) {
       gemv8<1>(sm, xs, part, warp, lane, 0, 1);
-    } else if constexpr (KM == 2) {
-      gemv8<2>(sm, xs, part, warp, lane, 0, 2);
+    } else if constexpr (KM == 2) {  // runtime M = 1 / 2 (the last token set of an odd M has one token)
+      if (M == 2)
+        gemv8<2>(sm, xs, part, warp, lane, 0, 2);
+      else
+        gemv8<1>(sm, xs, part, warp, lane, 0, 1);
     } else {
 #pragma unroll 1
       for (int t0 = 0; t0 < M; t0 += 2) {
@@ -622,7 +634,7 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
       const uint32_t g2 = __shfl_sync(0xffffffffu, wd, (8 * lane + 4) & 31);
       const uint32_t g3 = __shfl_sync(0xffffffffu, wd, (8 * lane + 6) & 31);
       if (lane < nrs)  // the cluster's rows as ONE contiguous run: nrs lanes x 16 B (64 B at NC=14)
-        st_mb16(a.up_st + static_cast<unsigned long long>(t * kHid + a.rank * kShard + row0 + 8 * lane) * 2,
+        st_mb16(a.up_st + static_cast<unsigned long long>((gt0 + t) * kHid + a.rank * kShard + row0 + 8 * lane) * 2,
                 make_uint4(g0, g1, g2, g3), a.mc);
     }
     T1_MARK(7)
@@ -632,14 +644,16 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   if (rs_j >= 0) {  // RS readers: one reader per 16-B RS chunk
 #pragma unroll 1
     for (int t = KM == 1 ? 0 : pt; t < M; t += 2) {
-      const __nv_bfloat16* rb = a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + t) * kShard + row0 + 8 * rs_j;
+      const __nv_bfloat16* rb = a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + gt0 + t) * kShard + row0 + 8 * rs_j;
 #pragma unroll 1
       for (int s = 0; s < kTp; ++s) st_sentinel16(rb + static_cast<long>(s) * rss * 8);
     }
   }
   if (tid == 0) {
     unsigned long long old;
-    asm volatile("atom.add.relaxed.gpu.global.u64 %0, [%1], 1;" : "=l"(old) : "l"(a.cnt + a.par * kCl + q) : "memory");
+    // readers-done counter of (par, token set, column slice q): NC arrivals per call (<= 48 slots of cnt[64])
+    asm volatile("atom.add.relaxed.gpu.global.u64 %0, [%1], 1;" : "=l"(old) : "l"(a.cnt + a.par * 16 + grp * kCl + q)
+                 : "memory");
     *flag = (old % static_cast<unsigned long long>(NC)) == static_cast<unsigned long long>(NC - 1);
   }
   __syncthreads();
@@ -647,7 +661,7 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
 #pragma unroll 1
     for (int i = tid; i < kTp * M * kFrag; i += kNT) {
       const int s = i / (M * kFrag), rr = i - s * (M * kFrag), t = rr / kFrag, k = rr - t * kFrag;
-      st_sentinel16(a.lat_mb + ((lat_par + static_cast<long>(s) * a.mmax + t) * kLat) + kCols * q + 8 * k);
+      st_sentinel16(a.lat_mb + ((lat_par + static_cast<long>(s) * a.mmax + gt0 + t) * kLat) + kCols * q + 8 * k);
     }
   }
   if (pf_mode == 2 && tid == kStage && gb % a.pf_stride == 0) t1_prefetch(a, gb / a.pf_stride);  // after the H4 publish
@@ -694,9 +708,10 @@ CUtensorMap make_wup_map(const void* base) {
 
 using T1Kern = void (*)(CUtensorMap, T1Args);
 template <int NC>
-T1Kern pick_km(int M) {
-  return M == 1 ? t1_kernel<NC, 1> : M == 2 ? t1_kernel<NC, 2> : t1_kernel<NC, 0>;
+T1Kern pick_km(int M) {  // M = 1; 2..4 (token-split sets of 2); 5..8 (legacy rounds of 2 tokens)
+  return M == 1 ? t1_kernel<NC, 1> : M <= 4 ? t1_kernel<NC, 2> : t1_kernel<NC, 0>;
 }
+inline int t1_sets(int M) { return M >= 2 && M <= 4 ? (M + 1) / 2 : 1; }
 T1Kern pick(int nc, int M) { return nc == 14 ? pick_km<14>(M) : pick_km<15>(M); }
 
 // k3t1.tail: see t1_kernel and T1_INTERFACE.md. Same leading arguments as k3mk.tail (variant = cluster count), plus
@@ -723,12 +738,12 @@ void tail(torch::Tensor lat_mb, torch::Tensor rs_mb, int64_t par, torch::Tensor 
   TORCH_CHECK(bf(gamma) && gamma.numel() == kLat && reinterpret_cast<uintptr_t>(gamma.data_ptr()) % 16 == 0);
   TORCH_CHECK(bf(up_mb) && up_mb.size(-1) == kHid && up_mb.numel() >= M * kHid);
   TORCH_CHECK(up_mc_ptr != 0 && up_mc_ptr % 16 == 0);
-  TORCH_CHECK(cnt.scalar_type() == at::kLong && cnt.is_cuda() && cnt.numel() >= 3 * kCl);
+  TORCH_CHECK(cnt.scalar_type() == at::kLong && cnt.is_cuda() && cnt.numel() >= 48, "cnt: int64 [>= 48]");
   // NC = 14 (default since v4): 32-row clusters align with the 64-row H4 lines (two writers per line)
   static const int env_nc = getenv("K3T1_NC") ? atoi(getenv("K3T1_NC")) : 14;
   const int nc = variant ? static_cast<int>(variant) : env_nc;
   TORCH_CHECK(nc == 14 || nc == 15, "k3t1.tail: variant (clusters) must be 14 or 15");
-  const int G = kCl * nc;
+  const int G = kCl * nc * t1_sets(static_cast<int>(M));  // M = 3 / 4: two token sets of NC clusters
   T1Args a{};
   a.M = static_cast<int>(M);
   a.par = static_cast<int>(par);
@@ -809,7 +824,7 @@ void tail(torch::Tensor lat_mb, torch::Tensor rs_mb, int64_t par, torch::Tensor 
   cudaLaunchConfig_t cfg{};
   cfg.gridDim = dim3(G);
   cfg.blockDim = dim3(kNT);
-  cfg.dynamicSmemBytes = t1_smem(static_cast<int>(M));
+  cfg.dynamicSmemBytes = t1_smem(M >= 2 && M <= 4 ? 2 : static_cast<int>(M));
   cfg.stream = c10::cuda::getCurrentCUDAStream();
   cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
@@ -824,11 +839,11 @@ void tail(torch::Tensor lat_mb, torch::Tensor rs_mb, int64_t par, torch::Tensor 
   C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, pick(nc, static_cast<int>(M)), tmv, a));
 }
 
-// k3t1.info(): per instantiation (NC 15, M = 1 / 2 / 3..8): [numRegs, localSizeBytes, static smem], then smem(M=1),
+// k3t1.info(): per instantiation (M = 1 / 2..4 / 5..8): [numRegs, localSizeBytes, static smem], then smem(M=1),
 // smem(M=8)
 std::vector<int64_t> info() {
   std::vector<int64_t> r;
-  for (int m2 : {1, 2, 3}) {
+  for (int m2 : {1, 2, 5}) {  // KM = 1, 2 (M = 2..4, token sets), 0 (M = 5..8)
     cudaFuncAttributes fa{};
     C10_CUDA_CHECK(cudaFuncGetAttributes(&fa, pick(15, m2)));
     r.push_back(fa.numRegs);
