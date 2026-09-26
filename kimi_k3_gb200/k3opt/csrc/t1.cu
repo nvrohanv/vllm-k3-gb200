@@ -15,31 +15,30 @@
 // no griddepcontrol.wait in publish mode (the mailbox data is the readiness); no exit cluster barrier. PDL trigger after
 // the H4 publish by default (K3T1_TRIG; in-server, triggering at entry launched the next layer's cascade early).
 //
-// Geometry: NC clusters x 8 CTAs (NC = 15: 120 CTAs, or 14: 112). The 448 up-proj rows of this rank are split in
-// 8-row groups: cluster c owns rows [row0(c), +nrows(c)) (NC=14: 32 each; NC=15: 11 x 32 + 4 x 24). CTA q of a
-// cluster owns latent columns [448 q, +448) (K-split) and "owner" rows [row0 + 4 q, +ro), ro = 4 or 0.
+// Geometry: NC clusters x 8 CTAs (NC = 14 (default): 112 CTAs, or 15: 120). The 448 up-proj rows of this rank are split
+// in 8-row groups: cluster c owns rows [row0(c), +nrows(c)) (NC=14: 32 each; NC=15: 11 x 32 + 4 x 24). CTA q of a
+// cluster owns latent columns [448 q, +448) (K-split); the cluster LEADER (q = 0) owns all nrows output rows.
+// SINGLE WRITER PER 128-B LINE (v4; agents/probe RESULTS s6.6): every line T1 stores is written by one warp.
 //   entry   thread 127 (never a poller) inits mbarriers, bulk-copies gamma[448 q..] and TMAs W_up[row0 .. +32]
 //           [448 q .. +448] (28 KB) into smem; optional next-layer L2 prefetch issue (pf_mode 1).
-//   front   (front mode only) griddepcontrol.wait; finalize this CTA's share of the unfinalized MoE output (vLLM
-//           finalize_top16_bf16 order) and publish it (lat multicast; RS peer stores by the last warp, in parallel).
+//   front   (front mode only) griddepcontrol.wait; tasks = whole 128-B lines: finalize a 64-column latent line (vLLM
+//           finalize_top16_bf16 order, lane = 2 columns) or copy a 64-column shared-out line to its owner rank's RS
+//           mailbox; one warp per line, stored as 8 lanes x 16 B.
 //   poll    rounds of 2 tokens: thread (t = t0 + tid/64, k = tid%64): k < 56 polls latent fragment 56 q + k of all
-//           16 sources (16-byte loads, every 32-bit word checked, branch-free); k == 56 polls this CTA's 4 RS rows
-//           (8 bytes of a 16-byte load; SAME code path, only the checked-word mask differs); fixed source order.
+//           16 sources (16-byte loads, every 32-bit word checked, branch-free); the leader's RS readers (4 x 16 B =
+//           32 rows per token) run the same code; fixed source order.
 //   rms     per-thread sequential sum of 8 bf16 squares, per-warp xor butterfly, lanes 0-7 push the warp sum to
 //           the 8 CTAs of the cluster (st.async + mbarrier); total per peer d in order (tot + w0_d) + w1_d.
 //   gemv    warp w: rows [8 w, +8) x the CTA's 448 columns (value-halving reduction, bit-identical to the per-row
-//           butterfly); fp32 partials -> owner CTAs over DSMEM.
-//   owner   fixed-order sum of the 8 partials, bf16, + sh, bf16, one 8-byte multimem.st per token.
-//   re-arm  RS words by their reader; readers-done counter cnt[par*8 + q] (relaxed atom); the NC-th reader CTA
-//           re-arms its latent columns. T1_EARLY_REARM: RS right after reading, atom before the GEMV, warps 1..3 re-arm
-//           the latent columns while warp 0 sums
-//           and publishes -> nothing but the exit after the H4 publish (-DT1_EARLY_REARM; default: after the publish,
-//           because the early atomic delayed the post-GEMV barrier by ~0.25 us and the exit was not on the path);
-//           optional next-layer prefetch issue (pf_mode 2).
+//           butterfly); fp32 partials of all rows -> the leader over DSMEM.
+//   owner   leader, warp per token, lane per row: fixed-order sum of the 8 partials, bf16, + sh, bf16; the cluster's
+//           rows are ONE contiguous 64-B run (NC=14: 2 writers per H4 line), stored as 4 lanes x 16 B multimem.st.
+//   re-arm  RS chunks by their reader after the publish; latent columns by the last of the NC readers
+//           (readers-done counter cnt[par*8 + q], relaxed atom); optional next-layer prefetch issue (pf_mode 2).
 // Kernel instantiations t1_kernel<NC, KM>: KM = 1 / 2 compile-time token count (the hot paths: no loops, no runtime
 // division; cold instruction fetch of branchy code dominated v1's time), 0 = runtime M 3..8.
 // Build knobs (experiments only): T1_DIAG (extra trace marks), T1_NOTMA, T1_POLL_NS, T1_POLL_LD, T1_FRONT_FENCE,
-// T1_EXIT_BARRIER, T1_NT (the kernel assumes 128).
+// T1_EXIT_BARRIER, T1_NT (the kernel assumes 128). Runtime env: K3T1_NC, K3T1_TRIG, K3T1_POLL_DELAY_NS, K3T1_CARVEOUT.
 #include <torch/all.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
@@ -66,7 +65,6 @@ constexpr int kNT = T1_NT;             // threads per CTA (128; other values for
 constexpr int kCols = kLat / kCl;      // 448 latent columns per CTA
 constexpr int kFrag = kCols / 8;       // 56 16-byte fragments per token per CTA
 constexpr int kBoxR = 32;              // W_up rows staged per CTA (max rows per cluster)
-constexpr int kRo = 4;                 // owner rows per CTA (or 0)
 constexpr int kStage = kNT - 1;        // staging thread (never a poller: pollers are k <= 56 of each half)
 #ifndef T1_POLL_NS
 #define T1_POLL_NS 64
@@ -323,20 +321,27 @@ __device__ __noinline__ void t1_prefetch(const T1Args& a, int issuer) {
   }
 }
 
-// smem: W [32][448] bf16 | gamma [448] | xs [M][448] bf16 | part [32][M] f32 | pr [8 q][4][M] f32 |
-//       ssr [8 q][2 w][M] f32 | shs [M][4] f32 | outv [M][4] bf16 | bars [4] | flag | trace [16]
+// smem: W [32][448] bf16 | gamma [448] | xs [M][448] bf16 | part [32][M] f32 | pr [8 q][32 rows][M] f32 (leader) |
+//       ssr [8 q][2 w][M] f32 | shs [M][32] f32 (leader) | bars [4] | flag | trace [16]
 __host__ __device__ constexpr int t1_smem(int M) {
-  return kBoxR * kCols * 2 + kCols * 2 + M * kCols * 2 + kBoxR * M * 4 + kCl * kRo * M * 4 + kCl * 2 * M * 4 +
-         M * kRo * 4 + ((M * kRo * 2 + 7) & ~7) + 4 * 8 + 8 + 16 * 8;
+  return kBoxR * kCols * 2 + kCols * 2 + M * kCols * 2 + kBoxR * M * 4 + kCl * kBoxR * M * 4 + kCl * 2 * M * 4 +
+         M * kBoxR * 4 + 4 * 8 + 8 + 16 * 8;
 }
-static_assert(t1_smem(kMmax) <= 40 * 1024, "LIGHT contract: <= 40 KB smem");
+static_assert(t1_smem(4) <= 40 * 1024, "LIGHT contract: <= 40 KB smem for the M <= 4 the server uses");
+static_assert(t1_smem(kMmax) <= 48 * 1024, "M = 5..8: <= 48 KB");
+constexpr int kLpt = kLat / 64;  // 128-B lines per token of a latent partial (56)
+constexpr int kRpt = kHid / 64;  // 128-B lines per token of the shared-expert output (112; 7 per destination rank)
 
 // NC: clusters (14 / 15). KM: tokens, compile-time for the hot M = 1 / 2 paths (no loops, no runtime M in the
 // critical path: cold instruction fetch of branchy code dominated v1), 0 = runtime M (3..8, rounds of 2 tokens).
+// SINGLE WRITER PER 128-B LINE (v4; agents/probe RESULTS s6.6: a line with several partial writers that SMs are
+// polling takes the stores ~4 us late): front-mode latent / RS lines are each stored by ONE warp as 8 lanes x 16 B;
+// the H4 rows of a cluster are summed and stored by the cluster leader (CTA 0) as one contiguous 64-B run (NC=14:
+// two writers per H4 line instead of 16).
 template <int NC, int KM>
 __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap tm_w, const __grid_constant__ T1Args a) {
   const int trig = (a.flags >> 4) & 3, pf_mode = a.flags & 3;
-  if (trig == 0) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");  // trigger at ENTRY (LIGHT contract)
+  if (trig == 0) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");  // trigger at ENTRY
   const unsigned long long t_entry = gtimer();
   extern __shared__ __align__(128) uint8_t sm[];
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
@@ -348,8 +353,8 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   constexpr int kBase = 56 / NC, kExtra = 56 % NC;
   const int nrows = 8 * (kBase + (c < kExtra ? 1 : 0));
   const int row0 = 8 * (c * kBase + min(c, kExtra));
-  const int ro = min(kRo, max(0, nrows - kRo * static_cast<int>(q)));  // 4 or 0
-  const int orow = row0 + kRo * static_cast<int>(q);
+  const bool leader = q == 0;  // owns (sums, adds the shared part to, publishes) all rows of the cluster
+  const int nrs = nrows >> 3;  // 16-B RS chunks (8 rows each) per token
   int so = kBoxR * kCols * 2;
   const __nv_bfloat16* gs = reinterpret_cast<const __nv_bfloat16*>(sm + so);
   so += kCols * 2;
@@ -357,14 +362,12 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   so += M * kCols * 2;
   float* part = reinterpret_cast<float*>(sm + so);
   so += kBoxR * M * 4;
-  float* pr = reinterpret_cast<float*>(sm + so);
-  so += kCl * kRo * M * 4;
+  float* pr = reinterpret_cast<float*>(sm + so);  // [8 q][32 rows][M] (leader)
+  so += kCl * kBoxR * M * 4;
   float* ssr = reinterpret_cast<float*>(sm + so);
   so += kCl * 2 * M * 4;
-  float* shs = reinterpret_cast<float*>(sm + so);
-  so += M * kRo * 4;
-  __nv_bfloat16* outv = reinterpret_cast<__nv_bfloat16*>(sm + so);
-  so += (M * kRo * 2 + 7) & ~7;
+  float* shs = reinterpret_cast<float*>(sm + so);  // [M][32] (leader)
+  so += M * kBoxR * 4;
   uint64_t* bars = reinterpret_cast<uint64_t*>(sm + so);  // [0] W, [1] sums of squares, [2] partials, [3] gamma
   int* flag = reinterpret_cast<int*>(bars + 4);
   unsigned long long* trs = reinterpret_cast<unsigned long long*>(bars + 5);
@@ -374,7 +377,7 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   if (tr && tid == 0) trs[slot] = gtimer();
   if (tr && tid == 0) {
     trs[0] = t_entry;
-    trs[9] = trs[10] = 0ull;
+    trs[6] = trs[7] = trs[9] = trs[10] = 0ull;
 #ifdef T1_DIAG
     trs[11] = trs[12] = trs[13] = trs[14] = trs[15] = 0ull;
 #endif
@@ -390,8 +393,8 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     mbar_arrive_expect_tx(bg, kCols * 2);
     tma_1d(smem_u32(gs), a.gamma + kCols * q, kCols * 2, bg);
-    mbar_arrive_expect_tx(bs, kCl * 2 * M * 4);    // the 8 CTAs' per-warp sums of squares, 2 warps per token
-    mbar_arrive_expect_tx(bp, kCl * ro * M * 4);   // the 8 CTAs' partials of our owner rows (0 if ro == 0)
+    mbar_arrive_expect_tx(bs, kCl * 2 * M * 4);                     // the 8 CTAs' per-warp sums of squares
+    mbar_arrive_expect_tx(bp, leader ? kCl * nrows * M * 4 : 0);   // the 8 CTAs' partials of the cluster's rows
 #ifdef T1_NOTMA  // timing experiment only: no W_up staging (the GEMV reads garbage)
     mbar_arrive_expect_tx(bw, 0);
     if (false)
@@ -413,64 +416,60 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
     asm volatile("griddepcontrol.wait;" ::: "memory");  // gemm2 / wts / shared_out come from the predecessor
     T1_MARK(9)
     constexpr int G = kCl * NC;
-    constexpr int nfin = (kLat / 8 + G - 1) / G;  // latent fragments per token finalized by this CTA
-    constexpr int nsd = (kHid / 8 + G - 1) / G;   // shared-out fragments per token pushed to their owner rank
-    // RS pushes by the LAST threads (kNT-1 downwards) so they overlap the finalize (first threads) instead of
-    // running after it in the same warp (two serialized L2 round trips).
+    // Tasks = whole 128-B lines: M * 56 latent lines (finalize) then M * 112 shared-out lines (RS copies); task
+    // -> CTA task % G, warp task / G (warp-uniform). Each line is written by ONE warp: 8 lanes x 16 B.
+    const int ntask = M * (kLpt + kRpt);
 #pragma unroll 1
-    for (int i = kNT - 1 - tid; i < M * nsd; i += kNT) {
-      const int t = i / nsd, cf = gb + G * (i - t * nsd);
-      if (cf >= kHid / 8) continue;
-      const int d = 8 * cf / kShard, col = 8 * cf - d * kShard;
-      const uint4 v = no_neg_zero4(*reinterpret_cast<const uint4*>(a.sh + static_cast<long>(t) * kHid + 8 * cf));
-      const unsigned long long ra =
-          a.rs_peer[d] +
-          static_cast<unsigned long long>(((static_cast<long>(a.par) * kTp + a.rank) * a.mmax + t) * kShard + col) * 2;
-      st_mb16(ra, v, 0);
-    }
-#pragma unroll 1
-    for (int i0 = 0; i0 < M * nfin * 8; i0 += kNT) {  // warp-uniform (8 threads per fragment)
-      const int i = i0 + tid;
-      const int it = i >> 3, e = i & 7, t = it / nfin, f = gb + G * (it - t * nfin);
-      const bool ok = i < M * nfin * 8 && f < kLat / 8;
-      float acc = 0.f;
-      if (ok) {  // vLLM finalize_top16_bf16: fp32 FMA over slots j = 0..15 in order, one bf16 rounding
-        const __nv_bfloat16* src = a.gemm2 + static_cast<long>(t * kTopK) * kLat + 8 * f + e;
+    for (int task = gb + G * warp; task < ntask; task += G * (kNT / 32)) {
+      if (task < M * kLpt) {
+        const int t = task / kLpt, L = task - t * kLpt;
+        // lane: columns 64 L + 2 lane, +1; vLLM finalize_top16_bf16 per column (fp32 FMA over slots 0..15 in order,
+        // one bf16 rounding), identical to the per-column arithmetic of every earlier version
+        const __nv_bfloat16* src = a.gemm2 + static_cast<long>(t * kTopK) * kLat + 64 * L + 2 * lane;
         const uint4* wp = reinterpret_cast<const uint4*>(a.wts + t * kTopK);
         const uint4 w01 = wp[0], w23 = wp[1];
         const uint32_t ww[8] = {w01.x, w01.y, w01.z, w01.w, w23.x, w23.y, w23.z, w23.w};
-        float vj[kTopK];
+        uint32_t vj[kTopK];
 #pragma unroll
-        for (int j = 0; j < kTopK; ++j) vj[j] = __bfloat162float(src[static_cast<long>(j) * kLat]);
+        for (int j = 0; j < kTopK; ++j) vj[j] = *reinterpret_cast<const uint32_t*>(src + static_cast<long>(j) * kLat);
+        float a0 = 0.f, a1 = 0.f;
 #pragma unroll
-        for (int j = 0; j < kTopK; ++j) acc = fmaf(vj[j], (j & 1) ? bf16_hi(ww[j >> 1]) : bf16_lo(ww[j >> 1]), acc);
-      }
-      const __nv_bfloat16 b16 = __float2bfloat16(acc);
-      uint32_t v = *reinterpret_cast<const uint16_t*>(&b16);
-      v |= __shfl_down_sync(0xffffffffu, v, 1) << 16;
-      const uint32_t w1 = __shfl_down_sync(0xffffffffu, v, 2);
-      const uint32_t w2 = __shfl_down_sync(0xffffffffu, v, 4);
-      const uint32_t w3 = __shfl_down_sync(0xffffffffu, v, 6);
-      if (ok && e == 0) {
-        st_mb16(a.lat_st + static_cast<unsigned long long>(((lat_par + a.rank * a.mmax + t) * kLat) + 8 * f) * 2,
-                no_neg_zero4(make_uint4(v, w1, w2, w3)), a.mc);
-      }
+        for (int j = 0; j < kTopK; ++j) {
+          const float wv = (j & 1) ? bf16_hi(ww[j >> 1]) : bf16_lo(ww[j >> 1]);
+          a0 = fmaf(bf16_lo(vj[j]), wv, a0);
+          a1 = fmaf(bf16_hi(vj[j]), wv, a1);
+        }
+        const __nv_bfloat162 b2 = __floats2bfloat162_rn(a0, a1);
+        const uint32_t wd = no_neg_zero(*reinterpret_cast<const uint32_t*>(&b2));
+        const uint32_t g0 = __shfl_sync(0xffffffffu, wd, (4 * lane) & 31);
+        const uint32_t g1 = __shfl_sync(0xffffffffu, wd, (4 * lane + 1) & 31);
+        const uint32_t g2 = __shfl_sync(0xffffffffu, wd, (4 * lane + 2) & 31);
+        const uint32_t g3 = __shfl_sync(0xffffffffu, wd, (4 * lane + 3) & 31);
+        if (lane < 8)
+          st_mb16(a.lat_st + static_cast<unsigned long long>(((lat_par + a.rank * a.mmax + t) * kLat) + 64 * L + 8 * lane) * 2,
+                  make_uint4(g0, g1, g2, g3), a.mc);
 #ifdef T1_DIAG
-      if (tr && tid == 0 && i0 == 0) {  // timestamp that cannot issue before the finalized value exists
-        unsigned long long tv;
-        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tv) : "r"(v));
-        trs[14] = tv;
-      }
+        if (tr && tid == 0) {  // timestamp that cannot issue before the finalized value exists
+          unsigned long long tv;
+          asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(tv) : "r"(wd));
+          trs[14] = tv;
+        }
 #endif
+      } else if (lane < 8) {  // shared-out line -> the owner rank's RS mailbox (7 whole lines per 448-column shard)
+        const int u = task - M * kLpt, t = u / kRpt, Ls = u - t * kRpt;
+        const int d = Ls / 7, cl = Ls - 7 * d;
+        const uint4 v = no_neg_zero4(*reinterpret_cast<const uint4*>(a.sh + static_cast<long>(t) * kHid + 64 * Ls + 8 * lane));
+        st_mb16(a.rs_peer[d] + static_cast<unsigned long long>(
+                                   ((static_cast<long>(a.par) * kTp + a.rank) * a.mmax + t) * kShard + 64 * cl + 8 * lane) * 2,
+                v, 0);
+      }
     }
-#ifdef T1_FRONT_FENCE  // A/B knob: on 1 GPU the front publishes became visible to the other CTAs' pollers only ~3.9 us
-    asm volatile("fence.acq_rel.sys;" ::: "memory");  // after the stores; this fence (~2.4 us) exposes them earlier
+#ifdef T1_FRONT_FENCE  // A/B knob (v3 finding; the single-writer lines should make it unnecessary)
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
 #endif
     T1_MARK(10)
   }
-  // Measured (1 GPU): a line that ~15 SMs (one CTA per cluster) poll BEFORE it is written shows the write only ~4 us
-  // later; read first after the write it is visible at once (RS words, 1 reader: ~0.8 us). K3T1_POLL_DELAY_NS holds the
-  // first read back (front mode: from our own publish, when the other CTAs' publishes land; publish mode: from entry).
+  // K3T1_POLL_DELAY_NS holds the first poll read back (front mode: from our own publish; publish mode: from entry).
   if (a.poll_delay_ns > 0) {
     const unsigned long long t_d = (a.gemm2 != nullptr ? gtimer() : t_entry) + static_cast<unsigned>(a.poll_delay_ns);
     while (gtimer() < t_d) {
@@ -480,31 +479,28 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   const int pt = tid >> 6, pk = tid & 63;
   const long lss = static_cast<long>(a.mmax) * kLat / 8;    // uint4 between latent sources
   const long rss = static_cast<long>(a.mmax) * kShard / 8;  // uint4 between RS sources
-  const int rs_hi = (orow & 4) ? 1 : 0;  // our 8 RS bytes are the high half of the aligned 16 bytes
-#ifdef T1_RS_COUPLED
-  constexpr bool kRsSep = false;
-#else
-  constexpr bool kRsSep = KM == 1;
-#endif
+  // RS readers (leader only), chunk j = rows [row0 + 8 j, +8) of the token: M = 1 -> tid 64 + j (warp 2, idle at M = 1,
+  // so a late RS word cannot hold back a latent warp's RMS push); M >= 2 -> lanes 56 + j of the token's odd warp.
+  int rs_j = -1;
+  if (leader) {
+    const int jj = KM == 1 ? tid - 64 : pk - kFrag;
+    if (jj >= 0 && jj < nrs) rs_j = jj;
+  }
 #pragma unroll 1
   for (int t0 = 0; t0 < M; t0 += 2) {
     const int t_ = t0 + pt;
     const bool lat_th = t_ < M && pk < kFrag;
-    // RS reader: M = 1 -> tid 64 (warp 2, idle at M = 1) so a late RS word cannot hold back warp 1's latent lanes
-    // (their RMS push waits for the whole warp); M >= 2 -> lane k = 56 of the token's second warp.
-    const bool rs_th = ro > 0 && (kRsSep ? (tid == 64 && t0 == 0) : (t_ < M && pk == kFrag));
-    const int t = kRsSep && rs_th ? 0 : t_;
+    const bool rs_th = rs_j >= 0 && (KM == 1 ? t0 == 0 : t_ < M);
+    const int t = (KM == 1 && rs_th) ? 0 : t_;
     float s2 = 0.f;
     if (lat_th || rs_th) {
-      // one code path for latent and RS readers (no divergence); RS readers ignore the neighbour CTA's 8 bytes
+      // one code path for latent and RS readers (no divergence in the poll)
       const uint4* base = lat_th ? reinterpret_cast<const uint4*>(a.lat_mb + (lat_par + t) * kLat + kCols * q + 8 * pk)
                                  : reinterpret_cast<const uint4*>(a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + t) *
-                                                                                kShard + (orow & ~7));
+                                                                                kShard + row0 + 8 * rs_j);
       const long ss = lat_th ? lss : rss;
-      const uint32_t ulo = (!lat_th && rs_hi) ? 1u : 0u, uhi = (!lat_th && !rs_hi) ? 1u : 0u;
-      const uint4 m = make_uint4(ulo, ulo, uhi, uhi);
       uint4 v[kTp];
-      poll16m(base, ss, m, v);
+      poll16m(base, ss, make_uint4(0u, 0u, 0u, 0u), v);
 #ifdef T1_DIAG
       if (tr && t0 == 0) {
         if (tid == 0) trs[12] = gtimer();
@@ -525,32 +521,20 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
         acc[6] += bf16_lo(v[s].w);
         acc[7] += bf16_hi(v[s].w);
       }
-      uint32_t xw[4];
-#pragma unroll
-      for (int k = 0; k < 4; ++k) {
-        const __nv_bfloat162 b2 = __floats2bfloat162_rn(acc[2 * k], acc[2 * k + 1]);
-        xw[k] = *reinterpret_cast<const uint32_t*>(&b2);
-        const __nv_bfloat162 sq2 = __hmul2(b2, b2);  // bf16 squares (vLLM-compatible)
-        s2 += __low2float(sq2);
-        s2 += __high2float(sq2);
-      }
       if (lat_th) {
+        uint32_t xw[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          const __nv_bfloat162 b2 = __floats2bfloat162_rn(acc[2 * k], acc[2 * k + 1]);
+          xw[k] = *reinterpret_cast<const uint32_t*>(&b2);
+          const __nv_bfloat162 sq2 = __hmul2(b2, b2);  // bf16 squares (vLLM-compatible)
+          s2 += __low2float(sq2);
+          s2 += __high2float(sq2);
+        }
         reinterpret_cast<uint4*>(xs + t * kCols)[pk] = make_uint4(xw[0], xw[1], xw[2], xw[3]);
       } else {
-        s2 = 0.f;
-        const int o = rs_hi ? 4 : 0;
 #pragma unroll
-        for (int r = 0; r < kRo; ++r) shs[t * kRo + r] = __bfloat162float(__float2bfloat16(acc[o + r]));
-#ifdef T1_EARLY_REARM
-        // one reader per RS word: re-arm now (values are in registers), not after the publish
-        const unsigned long long rb = reinterpret_cast<unsigned long long>(
-            a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + t) * kShard + orow);
-#pragma unroll
-        for (int s = 0; s < kTp; ++s)
-          asm volatile("st.global.v2.u32 [%0], {%1, %1};" ::"l"(rb + static_cast<unsigned long long>(s) * rss * 16),
-                       "r"(kSent)
-                       : "memory");
-#endif
+        for (int e = 0; e < 8; ++e) shs[t * kBoxR + 8 * rs_j + e] = __bfloat162float(__float2bfloat16(acc[e]));
       }
     }
 #pragma unroll
@@ -562,8 +546,8 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
       st_async4(mapa_u32(la, lane), s2, mapa_u32(bs, lane));
     }
   }
-  if (trig == 1) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");  // after the poll (P2: no BIG
-  T1_MARK(2)                                                                      // staging beside our pollers)
+  if (trig == 1) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");  // after the poll
+  T1_MARK(2)
   mbar_wait(bs, 0);
   T1_MARK(3)
   mbar_wait(bg, 0);  // landed long ago
@@ -593,13 +577,6 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
   mbar_wait(bw, 0);  // W landed (long ago)
   __syncthreads();  // every thread of this CTA has finished reading lat_mb / rs_mb
   T1_MARK(4)
-#ifdef T1_EARLY_REARM
-  // readers-done counter: issued now (off the critical path, its result is only needed after the GEMV)
-  unsigned long long rd_old = 0;
-  if (tid == kStage)
-    asm volatile("atom.add.relaxed.gpu.global.u64 %0, [%1], 1;" : "=l"(rd_old) : "l"(a.cnt + a.par * kCl + q)
-                 : "memory");
-#endif
   // ---------------------------------------------------------------- partial up-proj (warp = 8 rows)
   if (warp * 8 < nrows) {
     if constexpr (KM == 1) {
@@ -616,60 +593,48 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
       }
     }
   }
-#ifdef T1_EARLY_REARM
-  if (tid == kStage) *flag = (rd_old % static_cast<unsigned long long>(NC)) == static_cast<unsigned long long>(NC - 1);
-#endif
   __syncthreads();
-  // partials of owner rows -> their owner CTA d = row / 4: pr[our q][row % 4][t] of CTA d
+  // partials of the cluster's rows -> the leader: pr[our q][row][t] of CTA 0
 #pragma unroll 1
   for (int i = tid; i < nrows * M; i += kNT) {
-    const int r = i / M, t = i - r * M, d = r >> 2;
-    const uint32_t la = smem_u32(pr + (static_cast<int>(q) * kRo + (r & 3)) * M + t);
-    st_async4(mapa_u32(la, d), part[i], mapa_u32(bp, d));
+    const int r = i / M, t = i - r * M;
+    const uint32_t la = smem_u32(pr + (static_cast<int>(q) * kBoxR + r) * M + t);
+    st_async4(mapa_u32(la, 0), part[i], mapa_u32(bp, 0));
   }
   T1_MARK(5)
-  if (warp == 0) {  // owner rows and publishers are all in warp 0 (ro * M <= 32)
-    mbar_wait(bp, 0);
-    T1_MARK(6)
-    if (tid < ro * M) {  // fixed-order sum of the 8 partials, bf16, + shared, bf16
-      const int r = tid / M, t = tid - r * M;
-      float v = 0.f;
+  if (leader) {  // warp w: token w (+4): lane = row; fixed-order sum of the 8 partials, bf16, + shared, bf16
+#pragma unroll 1
+    for (int t = warp; t < M; t += kNT / 32) {
+      mbar_wait(bp, 0);
+      T1_MARK(6)
+      uint32_t hb = 0;
+      if (lane < nrows) {
+        float v = 0.f;
 #pragma unroll
-      for (int d = 0; d < kCl; ++d) v += pr[(d * kRo + r) * M + t];
-      const float gv = __bfloat162float(__float2bfloat16(v));
-      outv[t * kRo + r] = __float2bfloat16(gv + shs[t * kRo + r]);
-    }
-    __syncwarp();
-    if (ro > 0 && tid < M) {  // publish 4 rows of token tid (8 bytes)
-      const uint32_t* ow = reinterpret_cast<const uint32_t*>(outv + tid * kRo);
-      st_mb8(a.up_st + static_cast<unsigned long long>(tid * kHid + a.rank * kShard + orow) * 2, no_neg_zero(ow[0]),
-             no_neg_zero(ow[1]), a.mc);
+        for (int d = 0; d < kCl; ++d) v += pr[(d * kBoxR + lane) * M + t];
+        const float gv = __bfloat162float(__float2bfloat16(v));
+        const __nv_bfloat16 ob = __float2bfloat16(gv + shs[t * kBoxR + lane]);
+        hb = *reinterpret_cast<const uint16_t*>(&ob);
+      }
+      const uint32_t wd = no_neg_zero(hb | (__shfl_down_sync(0xffffffffu, hb, 1) << 16));  // rows 2k, 2k+1 at lane 2k
+      const uint32_t g0 = __shfl_sync(0xffffffffu, wd, (8 * lane) & 31);
+      const uint32_t g1 = __shfl_sync(0xffffffffu, wd, (8 * lane + 2) & 31);
+      const uint32_t g2 = __shfl_sync(0xffffffffu, wd, (8 * lane + 4) & 31);
+      const uint32_t g3 = __shfl_sync(0xffffffffu, wd, (8 * lane + 6) & 31);
+      if (lane < nrs)  // the cluster's rows as ONE contiguous run: nrs lanes x 16 B (64 B at NC=14)
+        st_mb16(a.up_st + static_cast<unsigned long long>(t * kHid + a.rank * kShard + row0 + 8 * lane) * 2,
+                make_uint4(g0, g1, g2, g3), a.mc);
     }
     T1_MARK(7)
   }
-#ifdef T1_EARLY_REARM
-  else if (*flag) {  // warps 1..3, while warp 0 sums and publishes: the NC-th cluster to read columns
-                     // [448 q, +448) of lat_mb[par] re-arms them (every reader has counted itself in)
+  if (trig == 2) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");  // default: after the H4 publish
+  // ---------------------------------------------------------------- re-arm (after the publish)
+  if (rs_j >= 0) {  // RS readers: one reader per 16-B RS chunk
 #pragma unroll 1
-    for (int i = tid - 32; i < kTp * M * kFrag; i += kNT - 32) {
-      const int s = i / (M * kFrag), rr = i - s * (M * kFrag), t = rr / kFrag, k = rr - t * kFrag;
-      st_sentinel16(a.lat_mb + ((lat_par + static_cast<long>(s) * a.mmax + t) * kLat) + kCols * q + 8 * k);
-    }
-  }
-#endif
-  if (trig == 2) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-#ifndef T1_EARLY_REARM  // default: re-arm after the publish (off the H4 path)
-  // ---------------------------------------------------------------- re-arm (off the critical path)
-  if (ro > 0 && (kRsSep ? tid == 64 : pk == kFrag)) {  // RS readers: one reader per word, re-arm right away
+    for (int t = KM == 1 ? 0 : pt; t < M; t += 2) {
+      const __nv_bfloat16* rb = a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + t) * kShard + row0 + 8 * rs_j;
 #pragma unroll 1
-    for (int t = kRsSep ? 0 : pt; t < M; t += 2) {
-      const unsigned long long rb = reinterpret_cast<unsigned long long>(
-          a.rs_mb + (static_cast<long>(a.par) * kTp * a.mmax + t) * kShard + orow);
-#pragma unroll 1
-      for (int s = 0; s < kTp; ++s)
-        asm volatile("st.global.v2.u32 [%0], {%1, %1};" ::"l"(rb + static_cast<unsigned long long>(s) * rss * 16),
-                     "r"(kSent)
-                     : "memory");
+      for (int s = 0; s < kTp; ++s) st_sentinel16(rb + static_cast<long>(s) * rss * 8);
     }
   }
   if (tid == 0) {
@@ -685,12 +650,9 @@ __global__ void __maxnreg__(120) t1_kernel(const __grid_constant__ CUtensorMap t
       st_sentinel16(a.lat_mb + ((lat_par + static_cast<long>(s) * a.mmax + t) * kLat) + kCols * q + 8 * k);
     }
   }
-#endif
   if (pf_mode == 2 && tid == kStage && gb % a.pf_stride == 0) t1_prefetch(a, gb / a.pf_stride);  // after the H4 publish
   // No exit barrier: a CTA may exit once no peer can still write into its smem, and every DSMEM push INTO this CTA
-  // has landed (all threads waited on bs; the owner warp waited on bp, which counts every partial pushed to us).
-  // The old barrier.cluster.arrive.release (a MEMBAR.ALL.GPU) delayed the exit, and T1's exit gates any successor
-  // that waits for full completion (non-PDL launches, griddepcontrol.wait chains).
+  // has landed (all threads waited on bs; the leader's owner warps waited on bp, which counts every partial).
 #ifdef T1_EXIT_BARRIER
   asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
@@ -762,7 +724,8 @@ void tail(torch::Tensor lat_mb, torch::Tensor rs_mb, int64_t par, torch::Tensor 
   TORCH_CHECK(bf(up_mb) && up_mb.size(-1) == kHid && up_mb.numel() >= M * kHid);
   TORCH_CHECK(up_mc_ptr != 0 && up_mc_ptr % 16 == 0);
   TORCH_CHECK(cnt.scalar_type() == at::kLong && cnt.is_cuda() && cnt.numel() >= 3 * kCl);
-  static const int env_nc = getenv("K3T1_NC") ? atoi(getenv("K3T1_NC")) : 15;
+  // NC = 14 (default since v4): 32-row clusters align with the 64-row H4 lines (two writers per line)
+  static const int env_nc = getenv("K3T1_NC") ? atoi(getenv("K3T1_NC")) : 14;
   const int nc = variant ? static_cast<int>(variant) : env_nc;
   TORCH_CHECK(nc == 14 || nc == 15, "k3t1.tail: variant (clusters) must be 14 or 15");
   const int G = kCl * nc;

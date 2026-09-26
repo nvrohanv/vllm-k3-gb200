@@ -41,6 +41,25 @@
 // Weight loads use an L2 evict-first cache policy (single-use stream; keeps L2 for x / partials / h images and
 // other layers' data): measured M = 8 29.8 -> 27.9 us, M = 4 18.8 -> 18.0 us (-DMOE8_EVICT_NORMAL to disable).
 // x loads are issued after the expert dedupe (-DMOE8_XLOAD_EARLY for the old order).
+//
+// v12 (cluster mode, MT = 4 i.e. M = 3..4; -DMOE8_CLUSTER=0 restores v11's grid): the grid is 36 clusters of 4
+// CTAs (144 of 152 SMs: the same HBM rate as 152, measured). The last 36 L experts in dedupe order (group B,
+// L = floor(D * MOE8_CL_B_PCT / 100 / 36), 1 at M = 4) are cluster-local: cluster k owns L whole experts, split
+// over its 4 CTAs. Their FC1 partials go to the tile owner and the owners' h chunks (+ one scale word per token)
+// go straight into every consumer's smem receive buffer with st.async + mbarrier complete_tx (DSMEM; dedicated
+// single-use receive buffers, so no flow control). The FC2 MMA warp waits on the receive barrier itself and builds
+// the SFB images from the pushed scale words. Group A (the other experts) keeps v11's global path; the order per
+// CTA stays FC1(A), FC1(B), FC2(A), FC2(B). Cluster barrier: every thread arrives (relaxed, after
+// fence.mbarrier_init) at the start; only the epilogue warps wait, right before their first remote store.
+// The per-CTA call counters of the SMs a 144-CTA grid does not use are advanced by the launched CTAs (h-image
+// parity stays in lockstep across calls with different grids). M <= 2 (no clusters) also runs on the 144-CTA grid
+// (-DMOE8_SMALLM_GRID=0: all SMs); M = 5..8 keeps v11's 152-CTA grid and code path.
+// v11 -> v12, same session, graph of 32 calls (us): M = 1 10.13 -> 9.67-9.71, M = 2 12.42-12.46 -> 12.29-12.34,
+// M = 3 15.42-15.45 -> 15.33-15.40, M = 4 17.47 -> 16.73-16.78 (other sessions: 17.52-17.60 -> 16.81-16.97),
+// M = 5..8 unchanged (within +-0.1). Numerics identical to v11 (same accumulation order, same quantization).
+// With a concurrent 32-CTA side kernel the 144-CTA grids co-reside far better: + 2 / 5 us side kernel costs
+// M = 4 +0.28 / +0.37 us (v11 +1.80 / +4.53), M = 2 +0.27 / +0.46 (v11 +2.08 / +4.80), M = 1 +0.27 / +3.45
+// (v11 +2.01 / +4.81); M = 8 unchanged (+0.8 / +3.7).
 // Warp roles (384 threads): w0 TMA producer, w1 MMA issuer, w2 h loader, w3 TMEM owner + h re-arm,
 // w4..7 and w8..11 two epilogue groups (alternate accumulators; TMEM lane quadrant = warp % 4).
 // Warps 2..11 quantize x first.
@@ -109,13 +128,58 @@ constexpr int kSmemBytes = kOffPf;
 #endif
 static_assert(kSmemBytes <= 232448, "smem");
 
+// ---- v12 cluster mode (MT = 4; MT = 8 with -DMOE8_CLUSTER_MT8=1): the grid is launched as clusters of kCl CTAs.
+// The last 36 L experts (group B) are cluster-local: cluster k owns L whole experts; their FC1 partials and h chunks
+// move over DSMEM (st.async + mbarrier complete_tx) into the receive buffers below. Group A = the other experts,
+// v11's global path.
+#ifndef MOE8_CLUSTER
+#define MOE8_CLUSTER 1
+#endif
+#ifndef MOE8_HPOLL_NS
+#define MOE8_HPOLL_NS 20  // h-loader: sleep between polls of a global h image
+#endif
+#ifndef MOE8_PPOLL_NS
+#define MOE8_PPOLL_NS 0  // owner: sleep between polls of a remote FC1 partial
+#endif
+#ifndef MOE8_PLOOK
+#define MOE8_PLOOK 0  // owner (MT = 8): load the next remote partial with the current one's first poll
+#endif
+#ifndef MOE8_CLUSTER_MT8
+#define MOE8_CLUSTER_MT8 0
+#endif
+#ifndef MOE8_CL_B_PCT
+#define MOE8_CL_B_PCT 60  // at most this % of the experts are cluster-local (L = floor(D * pct / 100 / #clusters))
+#endif
+#ifndef MOE8_CL_MAX_L
+#define MOE8_CL_MAX_L 4
+#endif
+#ifndef MOE8_CL_BFIRST
+#define MOE8_CL_BFIRST 0
+#endif
+
+constexpr int kCl = 4;
+template <int MT>
+__host__ __device__ constexpr bool cl_mode() {
+  return MOE8_CLUSTER != 0 && (MT == 4 || (MT == 8 && MOE8_CLUSTER_MT8 != 0));
+}
+#if defined(MOE8_PF_PARTIAL) && MOE8_CLUSTER
+#error "MOE8_PF_PARTIAL is not supported with the cluster mode"
+#endif
+constexpr int kOffHr = (kSmemBytes + 1023) / 1024 * 1024;  // 2 x 2 KB h receive images (B operand, SW128)
+constexpr int kOffHrsf = kOffHr + 2 * 2048;                // 2 x (2 x 128 + 384) SFB images of them
+constexpr int kOffHsc = kOffHrsf + 2 * 640;                // 2 x [3 tiles][8 tokens] u32 scale words (sb0 | sb1 << 8)
+constexpr int kOffPrecv = kOffHsc + 2 * 128;               // 2 remote pieces x [128 rows][MT] fp32 partials
+template <int MT>
+__host__ __device__ constexpr int smem_bytes() { return cl_mode<MT>() ? kOffPrecv + 2 * 128 * MT * 4 : kSmemBytes; }
+static_assert(kOffPrecv + 2 * 128 * 8 * 4 <= 232448, "smem (cluster mode)");
+
 // TMEM columns (all scale-factor bases are multiples of 4)
 constexpr uint32_t kTmemCols = 512;
 constexpr uint32_t kColAcc = 0;                        // kAcc x 8
 constexpr uint32_t kColSFA = 128;                      // kSlots x 8
-constexpr uint32_t kColSFBh = kColSFA + kSlots * 8;    // 2 x 8
+constexpr uint32_t kColSFBh = kColSFA + kSlots * 8;    // 4 x 8 (2 global-path buffers, 2 cluster receive buffers)
 constexpr uint32_t kColSFBx = 256;                     // 28 x 4
-static_assert(kAcc * 8 <= 128 && kColSFBh + 16 <= kColSFBx, "tmem");
+static_assert(kAcc * 8 <= 128 && kColSFBh + 32 <= kColSFBx, "tmem");
 
 // global workspace layout (bytes); everything starts as 0xFF.
 constexpr int kHImg = 2048 + 128;                          // per expert: B image + compact scales
@@ -147,6 +211,10 @@ struct Misc {
   int uof[kMaxPairs];
   alignas(16) signed char tokslot[kMaxPairs][kMaxM];
   alignas(16) uint8_t hst[2][4][8][16];
+  // v12 cluster mode (after v11's fields, so the other instantiations keep v11's layout)
+  uint64_t hrecv[2];   // DSMEM h chunks + scale words received (complete_tx from the owners)
+  uint64_t precv;      // DSMEM FC1 partials received
+  uint64_t hfullR[2];  // -DMOE8_CL_HLOADER only: the h loader has built receive buffer j's SFB images
 };
 static_assert(sizeof(Misc) <= 5120, "misc too big");
 
@@ -210,6 +278,78 @@ __device__ __forceinline__ uint32_t ld_volatile_u32(const void* p) {
 }
 __device__ __forceinline__ uint64_t desc_sf(uint32_t saddr) { return tc::smem_desc(saddr, 0, 128, 0); }
 
+// ---------------------------------------------------------------- cluster / DSMEM (cluster mode only)
+#ifndef MOE8_CL_WAIT
+#define MOE8_CL_WAIT 0  // DSMEM receive waits: 0 test_wait spin, 1 try_wait + suspend hint, 2 test_wait + nanosleep
+#endif
+#ifndef MOE8_CL_WAIT_NS
+#define MOE8_CL_WAIT_NS 1000
+#endif
+namespace clx {
+// shared::cta address -> shared::cluster address of the same offset in CTA `rank` of this cluster
+__device__ __forceinline__ uint32_t mapa(uint32_t saddr, uint32_t rank) {
+  uint32_t r;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(r) : "r"(saddr), "r"(rank));
+  return r;
+}
+__device__ __forceinline__ void st_async_v4(uint32_t caddr, uint4 v, uint32_t cbar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];" ::"r"(caddr),
+               "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w), "r"(cbar)
+               : "memory");
+}
+__device__ __forceinline__ void st_async_b32(uint32_t caddr, uint32_t v, uint32_t cbar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(caddr), "r"(v), "r"(cbar)
+               : "memory");
+}
+// Wait on a local mbarrier completed by remote st.async (acquire at cluster scope). Spins on test_wait: a thread
+// suspended in try_wait is not necessarily woken by a remote complete_tx (agents/moe8/body, agents/probe).
+__device__ __forceinline__ void wait(uint64_t* bar, uint32_t parity) {
+#ifdef TC_WAIT_TIMEOUT
+  {
+    const uint64_t t0 = tc::globaltimer();
+    while (!tc::mbar_test(bar, parity)) {
+      if (tc::globaltimer() - t0 > 2000000000ull) {
+        printf("clx::wait timeout: block %d thread %d parity %u\n", blockIdx.x, threadIdx.x, parity);
+        asm volatile("trap;");
+      }
+    }
+  }
+#endif
+#if MOE8_CL_WAIT == 0
+  asm volatile(
+      "{\n\t.reg .pred P1;\n\tWAIT_%=:\n\t"
+      "mbarrier.test_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1;\n\t"
+      "@!P1 bra WAIT_%=;\n\t}" ::"r"(tc::su32(bar)),
+      "r"(parity)
+      : "memory");
+#elif MOE8_CL_WAIT == 1  // suspend (bounded by the hint) instead of spinning
+  asm volatile(
+      "{\n\t.reg .pred P1;\n\tWAIT_%=:\n\t"
+      "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P1, [%0], %1, %2;\n\t"
+      "@!P1 bra WAIT_%=;\n\t}" ::"r"(tc::su32(bar)),
+      "r"(parity), "n"(MOE8_CL_WAIT_NS)
+      : "memory");
+#else  // test + nanosleep backoff
+  for (;;) {
+    uint32_t ok;
+    asm volatile(
+        "{\n\t.reg .pred P1;\n\tmbarrier.test_wait.parity.acquire.cluster.shared::cta.b64 P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t}"
+        : "=r"(ok)
+        : "r"(tc::su32(bar)), "r"(parity)
+        : "memory");
+    if (ok) break;
+    __nanosleep(MOE8_CL_WAIT_NS);
+  }
+#endif
+}
+__device__ __forceinline__ void arrive_release() { asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory"); }
+// Relaxed arrive: enough to publish mbarrier inits when preceded by fence.mbarrier_init.release.cluster (the
+// release arrive measured +0.4 us per call at M = 4).
+__device__ __forceinline__ void arrive_relaxed() { asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory"); }
+__device__ __forceinline__ void wait_acquire() { asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory"); }
+}  // namespace clx
+
 #ifdef MOE8_TRACE
 constexpr bool kTraceOn = true;
 #else
@@ -241,6 +381,12 @@ __device__ __forceinline__ void trace_ctr(const Params& p, int i, long long v) {
 __device__ __forceinline__ void trace_at(const Params& p, int idx, long long v) {
 #ifdef MOE8_TRACE
   if (p.trace != nullptr) p.trace[20480 + idx] = v;
+#endif
+}
+// Per-warp epilogue timestamps of FC1 owner tiles (MOE8_TRACE builds): trace[25600 + (T * 4 + ew) * 6 + k].
+__device__ __forceinline__ void trace_w(const Params& p, int T, int ew, int k, long long v) {
+#ifdef MOE8_TRACE
+  if (p.trace != nullptr && T < 400) p.trace[25600 + (T * 4 + ew) * 6 + k] = v;
 #endif
 }
 __device__ __forceinline__ int split_lo(int c, int total, int G) {
@@ -275,6 +421,13 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       tc::mbar_init(&ms.hfull[b], 1);
       tc::mbar_init(&ms.hempty[b], 1);
     }
+    if constexpr (cl_mode<MT>()) {
+      tc::mbar_init(&ms.hrecv[0], 1);
+      tc::mbar_init(&ms.hrecv[1], 1);
+      tc::mbar_init(&ms.precv, 1);
+      tc::mbar_init(&ms.hfullR[0], 1);
+      tc::mbar_init(&ms.hfullR[1], 1);
+    }
     for (int k = 0; k < kFc1Stages; ++k) tc::mbar_init(&ms.xready[k], 8 * p.M);
     tc::mbar_init(&ms.xgo, 1);
     for (int g = 0; g < 2; ++g)
@@ -284,6 +437,16 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
     tc::prefetch_tmap(&tmA2);
   }
   if (warp == 3) tc::tmem_alloc(&ms.tmem_base, kTmemCols);
+  // cluster mode: the mbarrier inits (thread 0, fence.mbarrier_init above) must be visible cluster-wide before any
+  // remote st.async. Every thread arrives (relaxed; thread 0's fence.mbarrier_init.release.cluster publishes the
+  // inits); only the epilogue warps wait, lazily, right before their first remote store (barrier.cluster.wait only
+  // waits for non-exited threads, so threads that never wait are fine). Measured: waiting in all warps at their
+  // start or end costs 0.1-0.25 us per call at M = 4; a release arrive another ~0.1.
+#ifdef MOE8_CL_ARRIVE_RELEASE
+  if constexpr (cl_mode<MT>()) clx::arrive_release();
+#else
+  if constexpr (cl_mode<MT>()) clx::arrive_relaxed();
+#endif
   int* table = reinterpret_cast<int*>(sm + kOffA);  // dedupe scratch (ring is still unused)
   for (int e = threadIdx.x; e < p.E; e += kThreads) table[e] = 0x7fffffff;
   // rows t >= M of the x B image and of its scale images stay zero
@@ -380,10 +543,18 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
   if (threadIdx.x == 0) trace_ev(p, 2);
   const int D = ms.D;
   const int P = ms.parity & 1;
+  constexpr bool kClu = cl_mode<MT>();
+  // cluster mode: L cluster-local experts per cluster (group 1 = experts [D - L * ncl, D)); L = 0: v11 groups
+  const int ncl = kClu ? G / kCl : 1, ck = kClu ? cta / kCl : 0, crank = kClu ? cta % kCl : 0;
+  const int L = kClu ? min(MOE8_CL_MAX_L, (D * MOE8_CL_B_PCT / 100) / ncl) : 0;
+  const bool loc1 = kClu && L > 0;
+  // group-1 FC1 stage / FC2 unit start of cluster CTA q (cluster mode, loc1)
+  auto lo1c = [&](int q) { return kFc1Tiles * kFc1Stages * L * ck + split_lo(q, kFc1Tiles * kFc1Stages * L, kCl); };
   // Two expert groups: FC1(A), FC1(B), FC2(A), FC2(B). Group A's h is ready long before FC2(A)
   // starts, and FC2(A) covers the latency of group B's FC1 -> h hand-off.
   // group A gets MOE8_GROUP_A_PCT % of the experts: a smaller group B leaves h(B) more slack behind FC2(A)
-  const int ub[3] = {0, D > MOE8_GROUP_MIN_D ? (D * MOE8_GROUP_A_PCT + 99) / 100 : D, D};
+  const int ub[3] = {0, loc1 ? D - L * ncl : (D > MOE8_GROUP_MIN_D ? (D * MOE8_GROUP_A_PCT + 99) / 100 : D), D};
+  auto lo2c = [&](int q) { return kFc2Tiles * (ub[1] + L * ck) + split_lo(q, kFc2Tiles * L, kCl); };
   // remote-partial prefetch (warp 3) only with two expert groups: at M <= 2 it measured slower
 #ifdef MOE8_PF_PARTIAL
 #ifdef MOE8_PF_ALL_M
@@ -399,10 +570,17 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
   for (int g = 0; g < 2; ++g) {
     const int De = ub[g + 1] - ub[g];
     S1g[g] = kFc1Tiles * kFc1Stages * De;
-    f1lo[g] = split_lo(cta, S1g[g], G);
-    f1hi[g] = split_lo(cta + 1, S1g[g], G);
-    f2lo[g] = kFc2Tiles * ub[g] + split_lo(cta, kFc2Tiles * De, G);
-    f2hi[g] = kFc2Tiles * ub[g] + split_lo(cta + 1, kFc2Tiles * De, G);
+    if (g == 1 && loc1) {
+      f1lo[g] = lo1c(crank);
+      f1hi[g] = lo1c(crank + 1);
+      f2lo[g] = lo2c(crank);
+      f2hi[g] = lo2c(crank + 1);
+    } else {
+      f1lo[g] = split_lo(cta, S1g[g], G);
+      f1hi[g] = split_lo(cta + 1, S1g[g], G);
+      f2lo[g] = kFc2Tiles * ub[g] + split_lo(cta, kFc2Tiles * De, G);
+      f2hi[g] = kFc2Tiles * ub[g] + split_lo(cta + 1, kFc2Tiles * De, G);
+    }
   }
   uint8_t* hset = p.ws + kWsH + static_cast<long>(P) * kMaxPairs * kHImg;
 
@@ -415,6 +593,10 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       // This CTA's stage sequence: FC1 group 0, FC1 group 1, FC2 group 0, FC2 group 1.
       const int n1a = f1hi[0] - f1lo[0], n1b = f1hi[1] - f1lo[1], n2a = f2hi[0] - f2lo[0], n2b = f2hi[1] - f2lo[1];
       const int total = n1a + n1b + n2a + n2b;
+      // stage order FC1(first group), FC1(other), FC2(first), FC2(other); MOE8_CL_BFIRST: the cluster-local group
+      // first (its DSMEM hand-off then hides behind FC1(A), the global one behind FC2(B))
+      const int gf = (kClu && loc1 && MOE8_CL_BFIRST) ? 1 : 0;
+      const int nf1 = gf ? n1b : n1a, nf2 = gf ? n2b : n2a;
       struct SInfo {
         Meta m;
         int row0, kc;           // TMA coordinates (weights)
@@ -423,8 +605,8 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       auto info = [&](int n) -> SInfo {
         SInfo si;
         if (n < n1a + n1b) {
-          const int g = n >= n1a ? 1 : 0;
-          const int s2 = f1lo[g] + (g ? n - n1a : n);
+          const int g = n >= nf1 ? gf ^ 1 : gf;
+          const int s2 = f1lo[g] + (n >= nf1 ? n - nf1 : n);
           const int T = kFc1Tiles * ub[g] + s2 / kFc1Stages, ks = s2 % kFc1Stages;
           const int e = ms.expert[T / 3], r = T % 3;
           const int flags =
@@ -435,10 +617,11 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           si.sf = p.w13s + static_cast<long>(e) * kW13ScaleBytes + r * 14336 + ks * 1024;
         } else {
           const int n2 = n - n1a - n1b;
-          const int g = n2 >= n2a ? 1 : 0;
-          const int j = f2lo[g] + (g ? n2 - n2a : n2);
+          const int g = n2 >= nf2 ? gf ^ 1 : gf;
+          const int j = f2lo[g] + (n2 >= nf2 ? n2 - nf2 : n2);
           const int u = j / kFc2Tiles, mt = j % kFc2Tiles, e = ms.expert[u];
-          si.m = Meta{kFC2, u, mt, 0};
+          // c: h buffer of a cluster-local expert (2 + its index among this CTA's group-1 experts), else 0
+          si.m = Meta{kFC2, u, mt, (kClu && g == 1 && loc1) ? 2 + u - f2lo[1] / kFc2Tiles : 0};
           si.row0 = e * kHidden + mt * 128;
           si.kc = 0;
           si.sf = p.w2s + static_cast<long>(e) * kW2ScaleBytes + mt * 1024;
@@ -555,6 +738,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       int phase = 0;
       int acc = 0, accph = 0, accuses = 0;
       int cur_u = -1, hord = -1;
+      int cur_hb = 0;  // cluster mode: h buffer of the current FC2 expert (0, 1: global path; 2, 3: receive)
       uint32_t xmask = 0;
       long long w_full = 0, w_acc = 0, w_h = 0, w_x = 0, t_issue = 0, n_st = 0;
       // Loop-invariant bases; per-slot / per-ks / per-acc operands are base + small offsets.
@@ -564,6 +748,8 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       const uint64_t xsf_src0 = desc_sf(tc::su32(sm + kOffXsf));             // + ks * 256 B / 16
       const uint64_t hdesc0 = tc::desc_sw128(tc::su32(sm + kOffHq));         // + b * 2 KB / 16
       const uint64_t hsf_src0 = desc_sf(tc::su32(sm + kOffHsf));             // + b * 640 B / 16
+      const uint64_t hdescR = tc::desc_sw128(tc::su32(sm + kOffHr));         // cluster receive buffers
+      const uint64_t hsfR = desc_sf(tc::su32(sm + kOffHrsf));
       const uint32_t bar_empty0 = tc::su32(&ms.empty[0]), bar_acc0 = tc::su32(&ms.accfull[0]);
       const uint32_t bar_hempty0 = tc::su32(&ms.hempty[0]);
       int slot = 0;
@@ -612,7 +798,11 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             trace_ctr(p, 4, w_x);
             trace_ctr(p, 5, t_issue);
             trace_ctr(p, 6, n_st);
-            if (cur_u >= 0) tc::mma_commit(&ms.hempty[hord & 1]);
+            if constexpr (kClu) {
+              if (cur_u >= 0 && cur_hb < 2) tc::mma_commit(&ms.hempty[cur_hb]);
+            } else {
+              if (cur_u >= 0) tc::mma_commit(&ms.hempty[hord & 1]);
+            }
           }
           for (int q = 0; q < 2; ++q) {  // one END per epilogue group
             if (accuses >= kAcc) tc::mbar_wait(&ms.accempty[acc], accph ^ 1);
@@ -641,6 +831,59 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           __syncwarp();
           if (kTraceOn && n_st == 0 && lane == 0) trace_ev(p, 10);
           if (last) acc_release(m);
+        } else if constexpr (kClu) {
+          uint32_t copy_sfb = 0, bar_hrel = 0;
+          if (m.a != cur_u) {  // new expert: release the previous h buffer, wait for this one
+            if (cur_u >= 0 && cur_hb < 2) bar_hrel = bar_hempty0 + cur_hb * 8;  // receive buffers: single use
+            cur_u = m.a;
+            const long long c1 = PCLK();
+            if (m.c >= 2) {  // cluster-local expert: receive buffer j = m.c - 2 (single use per call)
+              cur_hb = m.c;
+              const int j = m.c - 2;
+              if (kTraceOn && lane == 0) trace_ctr(p, 56 + j, static_cast<long long>(tc::globaltimer()));
+#ifdef MOE8_CL_HLOADER  // the h loader waits for the DSMEM chunks and builds the SFB images (one more hop)
+              tc::mbar_wait(&ms.hfullR[j], 0);
+#else
+              // wait for the owners' DSMEM chunks here and build the SFB images (rows t: scales of token t for
+              // k-blocks 4i..4i+3, words replicated) from the pushed scale words
+              clx::wait(&ms.hrecv[j], 0);
+              if (lane < 8) {
+                const uint32_t* sc = reinterpret_cast<const uint32_t*>(sm + kOffHsc + j * 128);
+                const uint32_t w0 = (sc[lane] & 0xffffu) | (sc[8 + lane] << 16), w1 = sc[16 + lane] & 0xffffu;
+                *reinterpret_cast<uint4*>(sm + kOffHrsf + j * 640 + lane * 16) = make_uint4(w0, w0, w0, w0);
+                *reinterpret_cast<uint4*>(sm + kOffHrsf + j * 640 + 128 + lane * 16) = make_uint4(w1, w1, w1, w1);
+              }
+              __syncwarp();
+#endif
+              if (kTraceOn && lane == 0) {
+                trace_ctr(p, 58 + j, static_cast<long long>(tc::globaltimer()));
+                trace_ctr(p, 60 + j, m.a);
+              }
+              tc::fence_proxy_async_smem();  // h image written by remote st.async, SFB images by this warp
+            } else {
+              ++hord;
+              cur_hb = hord & 1;
+              if (lane == 0 && hord < 8) trace_ctr(p, 32 + hord, static_cast<long long>(tc::globaltimer()));
+              tc::mbar_wait(&ms.hfull[cur_hb], (hord >> 1) & 1);
+              if (lane == 0 && hord < 8) {
+                trace_ctr(p, 40 + hord, static_cast<long long>(tc::globaltimer()));
+                trace_ctr(p, 48 + hord, m.a);
+              }
+            }
+            tc::tc_fence_after();
+            w_h += PCLK() - c1;
+            if (hord == 0 && lane == 0) trace_ev(p, 11);
+            copy_sfb = 1;
+          }
+          const bool rb = cur_hb >= 2;
+          const uint64_t hd = rb ? hdescR + (cur_hb - 2) * 128 : hdesc0 + cur_hb * 128;
+          const uint64_t hs = rb ? hsfR + (cur_hb - 2) * 40 : hsf_src0 + cur_hb * 40;
+          acc_acquire();
+          tc::fc2_stage(tmem + kColAcc + acc * 8, adesc0 + slot * 2048, hd, idesc, tmem + kColSFA + slot * 8,
+                        sfa_src0 + slot * 64, tmem + kColSFBh + cur_hb * 8, hs, copy_sfb, bar_hrel,
+                        bar_empty0 + slot * 8, bar_acc0 + acc * 8);
+          __syncwarp();
+          acc_release(m);
         } else {
           uint32_t copy_sfb = 0, bar_hrel = 0;
           if (m.a != cur_u) {  // new expert: release the previous h buffer, wait for this one
@@ -677,10 +920,38 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
     } else if (warp == 2) {
       // ================================================================ h loader
       int k = -1;
+      if constexpr (kClu) {
+        if (loc1 && lane == 0 && f2hi[1] > f2lo[1]) {  // arm the DSMEM h receive barriers (bytes may be arriving)
+          const int u0 = f2lo[1] / kFc2Tiles, u1 = (f2hi[1] - 1) / kFc2Tiles;
+          if (u1 - u0 > 1) asm volatile("trap;");
+          for (int u = u0; u <= u1; ++u) tc::mbar_expect_tx(&ms.hrecv[u - u0], 3 * M * (4 * 16 + 4));
+        }
+      }
       for (int g = 0; g < 2; ++g) {
         if (f2hi[g] <= f2lo[g]) continue;
         const int u0 = f2lo[g] / kFc2Tiles, u1 = (f2hi[g] - 1) / kFc2Tiles;
         for (int u = u0; u <= u1; ++u) {
+          if constexpr (kClu) {
+            if (g == 1 && loc1) {  // cluster-local expert: owners pushed the image + scale words (DSMEM)
+#ifndef MOE8_CL_HLOADER
+              continue;  // the MMA warp waits for it itself
+#endif
+              const int j = u - u0;
+#ifndef MOE8_DBG_NO_BWAIT  // timing bound only (wrong results, and remote stores may land after exit)
+              clx::wait(&ms.hrecv[j], 0);
+#endif
+              if (lane < 8) {  // SFB images: row t = scales of token t for k-blocks 4i..4i+3 (words replicated)
+                const uint32_t* sc = reinterpret_cast<const uint32_t*>(sm + kOffHsc + j * 128);
+                const uint32_t w0 = (sc[lane] & 0xffffu) | (sc[8 + lane] << 16), w1 = sc[16 + lane] & 0xffffu;
+                *reinterpret_cast<uint4*>(sm + kOffHrsf + j * 640 + lane * 16) = make_uint4(w0, w0, w0, w0);
+                *reinterpret_cast<uint4*>(sm + kOffHrsf + j * 640 + 128 + lane * 16) = make_uint4(w1, w1, w1, w1);
+              }
+              tc::fence_proxy_async_smem();
+              __syncwarp();
+              if (lane == 0) tc::mbar_arrive(&ms.hfullR[j]);
+              continue;
+            }
+          }
           ++k;
           const int b = k & 1;
           if (k >= 2) tc::mbar_wait(&ms.hempty[b], ((k >> 1) - 1) & 1);
@@ -688,6 +959,11 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           if (lane == 0 && k < 8) trace_ctr(p, 16 + k, static_cast<long long>(tc::globaltimer()));
           uint4 q[4];
           uint32_t s4;
+#ifdef MOE8_DBG_NO_HPOLL  // timing bound only (wrong results): h is "ready" as soon as a buffer is free
+          for (int v = 0; v < 4; ++v) q[v] = make_uint4(0, 0, 0, 0);
+          s4 = 0x7f7f7f7fu;
+          if (false)
+#endif
           for (;;) {
             bool bad = false;
 #pragma unroll
@@ -702,7 +978,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             s4 = ld_volatile_u32(src + 2048 + lane * 4);
             if ((lane & 3) < 2) bad |= has_ff_byte(s4 & ((lane & 3) == 0 ? 0xffffffffu : 0x0000ffffu));
             if (!__any_sync(0xffffffffu, bad)) break;
-            __nanosleep(20);
+            __nanosleep(MOE8_HPOLL_NS);
           }
           uint4* dq = reinterpret_cast<uint4*>(sm + kOffHq + b * 2048);
 #pragma unroll
@@ -723,6 +999,19 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       }
     } else if (warp == 3) {
       // ================================================================ re-arm the idle h parity
+      if constexpr (kClu) {
+        // arm the DSMEM partial receive barrier: the tile holding my last group-1 stage, if I own it and it
+        // continues into the next cluster CTAs' ranges (at most 2 remote pieces)
+        if (loc1 && lane == 0 && f1hi[1] > f1lo[1]) {
+          const int s0 = ((f1hi[1] - 1) / kFc1Stages) * kFc1Stages;
+          if (s0 >= f1lo[1] && s0 + kFc1Stages > f1hi[1]) {
+            int np = 0;
+            for (int q = crank + 1; q < kCl; ++q) np += lo1c(q) < s0 + kFc1Stages ? 1 : 0;
+            if (np > 2) asm volatile("trap;");
+            if (np > 0) tc::mbar_expect_tx(&ms.precv, np * 128 * MT * 4);
+          }
+        }
+      }
       uint4* other = reinterpret_cast<uint4*>(p.ws + kWsH + static_cast<long>(P ^ 1) * kMaxPairs * kHImg);
       const int n16 = kMaxPairs * kHImg / 16;
       const int lo = split_lo(cta, n16, G), hi = split_lo(cta + 1, n16, G);
@@ -776,6 +1065,15 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
       // ================================================================ epilogue (two groups of 4 warps;
       // group eg handles accumulators eg, eg + 2, ...; ew = TMEM lane quadrant)
       const int ew = warp & 3, eg = (warp - 4) >> 2;
+      // cluster mode: only the epilogue warps store to peers; each waits once on the cluster barrier (peers'
+      // mbarrier inits visible) before its first remote store
+      bool clw = false;
+      auto cl_ready = [&]() {
+        if (!clw) {
+          clx::wait_acquire();
+          clw = true;
+        }
+      };
       const int ebar = eg == 0 ? 1 : 4;
       const uint32_t tl = tmem + (static_cast<uint32_t>(32 * ew) << 16);
       const int row = 32 * ew + lane;  // physical row within the 128-row tile
@@ -789,6 +1087,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
         tc::mbar_wait(&ms.accfull[acc], accph);
         tc::tc_fence_after();
         e_wait += PCLK() - ec0;
+        const long long t_accw = kTraceOn ? static_cast<long long>(tc::globaltimer()) : 0ll;
         ec0 = PCLK();
         const Meta m = ms.accmeta[acc];
         if (m.type == kEnd) break;
@@ -805,7 +1104,25 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           const int T = m.a;
           const int g = (T >= kFc1Tiles * ub[1]) ? 1 : 0;
           const int s0 = (T - kFc1Tiles * ub[g]) * kFc1Stages;  // group-local first stage of the tile
+          const bool locg = kClu && g == 1 && loc1;  // cluster-local expert (warp-uniform)
+
           if (s0 < f1lo[g]) {  // not the owner: publish the partial
+            if constexpr (kClu) {
+              if (locg) {  // DSMEM: [row][MT] fp32 into the owner's receive slot (cluster CTAs are consecutive)
+                cl_ready();
+                int qo = crank - 1;
+                while (qo > 0 && lo1c(qo) > s0) --qo;
+                const uint32_t la = tc::su32(sm + kOffPrecv + (crank - qo - 1) * (128 * MT * 4) + row * (MT * 4));
+                const uint32_t ra = clx::mapa(la, qo), rbar = clx::mapa(tc::su32(&ms.precv), qo);
+#pragma unroll
+                for (int q4 = 0; q4 < MT / 4; ++q4)
+                  clx::st_async_v4(ra + 16 * q4,
+                                   make_uint4(__float_as_uint(v[4 * q4]), __float_as_uint(v[4 * q4 + 1]),
+                                              __float_as_uint(v[4 * q4 + 2]), __float_as_uint(v[4 * q4 + 3])),
+                                   rbar);
+                continue;
+              }
+            }
             float* dst = pbase + (static_cast<long>(g) * kMaxG + cta) * 1024 + row;
 #pragma unroll
             for (int t = 0; t < MT; ++t)
@@ -814,8 +1131,40 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           }
           if (eg == 0 && ew == 0 && lane == 0 && kTraceOn && p.trace != nullptr && p.trace[cta * 128 + 17] == 0) trace_ev(p, 17);
           if (ew == 0 && lane == 0 && T < 400) trace_at(p, T, static_cast<long long>(tc::globaltimer()));
+          if (kTraceOn && lane == 0) {
+            trace_w(p, T, ew, 5, t_accw);
+            trace_w(p, T, ew, 0, static_cast<long long>(tc::globaltimer()));
+          }
           // Other pieces of this tile: CTAs cta+1.. whose ranges start inside the tile.
           int ipf = 0;
+          bool gpoll = true;
+          if constexpr (kClu) {
+            if (locg) {  // DSMEM pieces (at most 2: cluster CTAs crank+1.. whose ranges start inside the tile)
+              gpoll = false;
+              int np = 0;
+              for (int q = crank + 1; q < kCl; ++q) np += lo1c(q) < s0 + kFc1Stages ? 1 : 0;
+              if (np > 0) {
+#ifndef MOE8_DBG_NO_BWAIT
+                clx::wait(&ms.precv, 0);
+#endif
+#pragma unroll 1
+                for (int i = 0; i < np; ++i) {  // (np <= 2; unrolled, this loop was 1.9 KB of SASS)
+                  const float* pr = reinterpret_cast<const float*>(sm + kOffPrecv + i * (128 * MT * 4)) + row * MT;
+#pragma unroll
+                  for (int t = 0; t < MT; ++t) v[t] += pr[t];
+                }
+              }
+            }
+          }
+#ifdef MOE8_DBG_NO_PPOLL  // timing bound only (wrong results): the owner does not wait for remote partials
+          gpoll = false;
+#endif
+          // opt-in, MT = 8 only: measured M = 8 27.9 -> 27.7 us but M = 5..7 +0.2..0.4 (even when gated off at run
+          // time: code layout), and +0.05..0.15 us at M <= 4
+          constexpr bool kPlook = MOE8_PLOOK != 0 && MT == 8;
+          float nv[MT];
+          int nc = -1;
+          if (gpoll)
           for (int c2 = cta + 1; c2 < G && split_lo(c2, S1g[g], G) < s0 + kFc1Stages; ++c2) {
             if (split_lo(c2 + 1, S1g[g], G) == split_lo(c2, S1g[g], G)) continue;  // empty range: no piece
 #ifdef MOE8_PF_PARTIAL
@@ -831,6 +1180,26 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
 #endif
             float* src = pbase + (static_cast<long>(g) * kMaxG + c2) * 1024 + row;
             float pv[8];
+            bool okp = false;
+            // look-ahead: the next CTA's slot was loaded together with this piece's first poll (a CTA publishes
+            // its piece of this tile at the start of its range, long before the owner gets here)
+            if (kPlook && nc == c2) {
+              bool bad = false;
+#pragma unroll
+              for (int t = 0; t < MT; ++t) bad |= t < M && __float_as_uint(nv[t]) == 0xffffffffu;
+              okp = !__any_sync(0xffffffffu, bad);
+              if (okp) {
+#pragma unroll
+                for (int t = 0; t < MT; ++t) pv[t] = nv[t];
+              }
+            }
+            if (kPlook && c2 + 1 < G) {
+              nc = c2 + 1;
+              const float* ns = pbase + (static_cast<long>(g) * kMaxG + nc) * 1024 + row;
+#pragma unroll
+              for (int t = 0; t < MT; ++t) nv[t] = t < M ? __uint_as_float(ld_volatile_u32(ns + t * 128)) : 0.f;
+            }
+            if (!okp)
             for (;;) {
               bool bad = false;
 #pragma unroll
@@ -843,6 +1212,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
                 }
               }
               if (!__any_sync(0xffffffffu, bad)) break;
+              if (MOE8_PPOLL_NS > 0) __nanosleep(MOE8_PPOLL_NS);
             }
 #pragma unroll
             for (int t = 0; t < MT; ++t)
@@ -853,6 +1223,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
           }
           if (eg == 0 && ew == 0 && lane == 0) trace_ev(p, 24);
           if (ew == 0 && lane == 0 && T < 400) trace_at(p, 400 + T, static_cast<long long>(tc::globaltimer()));
+          if (kTraceOn && lane == 0) trace_w(p, T, ew, 1, static_cast<long long>(tc::globaltimer()));
           const int u = T / 3, r = T % 3;
           float h[MT], am[MT];
 #pragma unroll
@@ -872,6 +1243,7 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             for (int t = 0; t < MT; ++t) ms.amax[eg][ew][t] = am[t];
           }
           asm volatile("bar.sync %0, 128;" ::"r"(ebar) : "memory");
+          if (kTraceOn && lane == 0) trace_w(p, T, ew, 2, static_cast<long long>(tc::globaltimer()));
           int sbt = 0;
 #pragma unroll
           for (int t = 0; t < MT; ++t) {
@@ -882,6 +1254,37 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
                   static_cast<uint8_t>(__nv_cvt_float_to_fp8(h[t] * mx_rescale(sb), __NV_SATFINITE, __NV_E4M3));
           }
           __syncwarp();
+          if constexpr (kClu) {
+            if (locg) {  // push this 64-neuron chunk (+ its 2 scale bytes per token) to every consumer in the cluster
+              cl_ready();
+              if (lane < M) {
+                const int t = lane, kc = 4 * r + ew;
+                const uint4 val = *reinterpret_cast<const uint4*>(ms.hst[eg][ew][t]);
+                uint32_t sw = 0;
+                if (ew == 0)
+                  sw = static_cast<uint32_t>(mx_exp(fmaxf(ms.amax[eg][0][t], ms.amax[eg][1][t]))) |
+                       (static_cast<uint32_t>(mx_exp(fmaxf(ms.amax[eg][2][t], ms.amax[eg][3][t]))) << 8);
+                const uint32_t la = tc::su32(sm + kOffHr + (kc / 8) * 1024 + t * 128 + (((kc % 8) ^ t) * 16));
+                const uint32_t ls = tc::su32(sm + kOffHsc + r * 32 + t * 4);
+                const uint32_t lb = tc::su32(&ms.hrecv[0]);
+#pragma unroll 1
+                for (int q = 0; q < kCl; ++q) {
+                  const int lo = lo2c(q), hi = lo2c(q + 1);
+                  if (lo < kFc2Tiles * (u + 1) && hi > kFc2Tiles * u) {
+                    const int jq = u - lo / kFc2Tiles;
+                    const uint32_t rbar = clx::mapa(lb + 8 * jq, q);
+                    clx::st_async_v4(clx::mapa(la + jq * 2048, q), val, rbar);
+                    if (ew == 0) clx::st_async_b32(clx::mapa(ls + jq * 128, q), sw, rbar);
+                  }
+                }
+              }
+              if (kTraceOn && lane == 0) trace_w(p, T, ew, 3, static_cast<long long>(tc::globaltimer()));
+              asm volatile("bar.sync %0, 128;" ::"r"(ebar) : "memory");  // ms.amax / hst reuse
+              if (kTraceOn && lane == 0) trace_w(p, T, ew, 4, static_cast<long long>(tc::globaltimer()));
+              if (ew == 0 && lane == 0 && T < 400) trace_at(p, 800 + T, static_cast<long long>(tc::globaltimer()));
+              continue;
+            }
+          }
           uint8_t* himg = hset + static_cast<long>(u) * kHImg;
           if (lane < 8) {  // all 8 rows are written (the FC2 side validates every row); rows t >= MT are 0
             const int t = lane, kc = 4 * r + ew;
@@ -889,7 +1292,9 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
             *reinterpret_cast<uint4*>(himg + (kc / 8) * 1024 + t * 128 + (((kc % 8) ^ t) * 16)) = val;
             if ((ew & 1) == 0) himg[2048 + t * 16 + 2 * r + ew / 2] = static_cast<uint8_t>(sbt);
           }
+          if (kTraceOn && lane == 0) trace_w(p, T, ew, 3, static_cast<long long>(tc::globaltimer()));
           asm volatile("bar.sync %0, 128;" ::"r"(ebar) : "memory");  // ms.amax / hst reuse
+          if (kTraceOn && lane == 0) trace_w(p, T, ew, 4, static_cast<long long>(tc::globaltimer()));
           if (eg == 0 && ew == 0 && lane == 0) trace_ev(p, 18);
           if (ew == 0 && lane == 0 && T < 400) trace_at(p, 800 + T, static_cast<long long>(tc::globaltimer()));
         } else {
@@ -930,6 +1335,9 @@ moe8_kernel(const __grid_constant__ CUtensorMap tmA1, const __grid_constant__ CU
   }
   if (threadIdx.x == 0) {
     ctr[cta] = ms.parity + 1;
+    // A smaller grid (cluster mode: 144 of 152 SMs) also advances the counters of the CTAs it does not launch,
+    // so all per-CTA call counters (the h-image parity) stay in lockstep across calls with different grids.
+    if (cta < kMaxG - G) ctr[G + cta] = ms.parity + 1;  // (G >= kMaxG / 2)
     trace_ev(p, 20);
   }
 }
@@ -990,13 +1398,32 @@ void launch(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::
               out.is_contiguous());
   TORCH_CHECK(linear_beta > 0.0 && beta > 0.0);
   const int dev = x.get_device();
-  static int sms = 0;
+  static int sms = 0, gcl = 0;
   if (sms == 0) {
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
-    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<1>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<2>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<4>()));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(moe8_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<8>()));
+    // cluster-mode grid: as many kCl-CTA clusters as fit co-resident (36 on GB200 at ~220 KB smem: 144 CTAs)
+    cudaLaunchConfig_t oc{};
+    oc.gridDim = dim3(kCl * (sms / kCl));
+    oc.blockDim = dim3(kThreads);
+    oc.dynamicSmemBytes = smem_bytes<4>();
+    cudaLaunchAttribute oa[1];
+    oa[0].id = cudaLaunchAttributeClusterDimension;
+    oa[0].val.clusterDim.x = kCl;
+    oa[0].val.clusterDim.y = 1;
+    oa[0].val.clusterDim.z = 1;
+    oc.attrs = oa;
+    oc.numAttrs = 1;
+    int ncl = 0;
+    C10_CUDA_CHECK(cudaOccupancyMaxActiveClusters(&ncl, moe8_kernel<4>, &oc));
+#ifdef MOE8_CL_NCL  // experiment: fewer clusters
+    ncl = std::min(ncl, MOE8_CL_NCL);
+#endif
+    gcl = kCl * std::min(ncl, sms / kCl);
+    TORCH_CHECK(gcl >= kCl && 2 * gcl >= kMaxG, "moe8: too few co-resident clusters");
   }
   TORCH_CHECK(sms <= kMaxG);
   // Tensor maps per weight pair (one entry per MoE layer), encoded once; passed by value as kernel
@@ -1053,14 +1480,38 @@ void launch(const torch::Tensor& x, const torch::Tensor& topk_ids, const torch::
   cfg.dynamicSmemBytes = kSmemBytes;
 #endif
   cfg.stream = c10::cuda::getCurrentCUDAStream();
-  cudaLaunchAttribute attr[1];
+  cudaLaunchAttribute attr[2];
   attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+#ifdef MOE8_NO_PDL  // experiment: plain stream order
+  attr[0].val.programmaticStreamSerializationAllowed = 0;
+#else
   attr[0].val.programmaticStreamSerializationAllowed = 1;
+#endif
+  attr[1].id = cudaLaunchAttributeClusterDimension;
+  attr[1].val.clusterDim.x = kCl;
+  attr[1].val.clusterDim.y = 1;
+  attr[1].val.clusterDim.z = 1;
   cfg.attrs = attr;
   cfg.numAttrs = 1;
-  if (M == 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<1>, mc->a1, mc->a2, prm));
-  else if (M == 2) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<2>, mc->a1, mc->a2, prm));
-  else if (M <= 4) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<4>, mc->a1, mc->a2, prm));
+#ifdef MOE8_GRID_CAP  // experiment: cap the non-cluster grid
+  cfg.gridDim = dim3(std::min(sms, MOE8_GRID_CAP));
+#endif
+  const int MT = M == 1 ? 1 : M == 2 ? 2 : M <= 4 ? 4 : 8;
+  const bool clu = MT == 4 ? cl_mode<4>() : MT == 8 ? cl_mode<8>() : false;
+#ifndef MOE8_SMALLM_GRID
+#define MOE8_SMALLM_GRID 1
+#endif
+  // M <= 2: the same 144-CTA grid without clusters (measured M = 1 10.2 -> 9.7 us, M = 2 12.47 -> 12.35; M = 8 would
+  // lose 0.2 us, so it keeps all SMs). The 8 idle SMs also let a small co-running kernel start at once.
+  if (MOE8_SMALLM_GRID && MT <= 2) cfg.gridDim = dim3(std::min(sms, gcl));
+  if (clu) {
+    cfg.gridDim = dim3(gcl);
+    cfg.numAttrs = 2;
+    cfg.dynamicSmemBytes = MT == 4 ? smem_bytes<4>() : smem_bytes<8>();
+  }
+  if (MT == 1) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<1>, mc->a1, mc->a2, prm));
+  else if (MT == 2) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<2>, mc->a1, mc->a2, prm));
+  else if (MT == 4) C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<4>, mc->a1, mc->a2, prm));
   else C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, moe8_kernel<8>, mc->a1, mc->a2, prm));
 }
 

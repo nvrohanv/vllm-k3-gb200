@@ -7,10 +7,10 @@ spec-dec, 1 input / 1024 output tokens, concurrency B, and the metric is decode-
 
 | B | blog GB200 vLLM | our repro of stock vLLM | **current best** | TPU v7 (blog) | TPU +25% target |
 |---|---|---|---|---|---|
-| 1 | 127 | 127.2 (7.86 ms) | **206.6 (4.840 ms)** | 249 | 311 (3.2 ms) |
-| 2 | 227 | 229.4 (8.72 ms) | **363.9 (5.496 ms)** | 392 | 490 |
-| 4 | 373 | 384.6 (10.40 ms) | **593.6 (6.738 ms)** | 515 | 644 |
-| 8 | 636 | 663.3 (12.06 ms) | **979.8 (8.165 ms)** | 865 | 1081 (7.4 ms) |
+| 1 | 127 | 127.2 (7.86 ms) | **211.5 (4.727 ms)** | 249 | 311 (3.2 ms) |
+| 2 | 227 | 229.4 (8.72 ms) | **372.2 (5.374 ms)** | 392 | 490 |
+| 4 | 373 | 384.6 (10.40 ms) | **607.3 (6.587 ms)** | 515 | 644 |
+| 8 | 636 | 663.3 (12.06 ms) | **982.9 (8.139 ms)** | 865 | 1081 (7.4 ms) |
 
 ## How it works
 
@@ -144,7 +144,9 @@ source files are edited; the patches are installed at plugin registration.
 | + moe8 v11: per-token-capacity kernel instantiation MT in {1,2,4,8} (`v11`) | 5.038 | 8.582 (B=2 5.586, B=4 6.774) |
 | + L2 evict_first cache hint on the MoE front kernel's read-once weight TMAs, so dead weights stop crowding the next kernels' L2 working set (`v11ef`) | 4.920 | 8.586 (B=2 5.582, B=4 6.777) |
 | + M=1/M=2 dense-GEMM plans: CuTe skinny with static K (weights prefetched before the PDL wait, streaming cache mode), and FlashInfer split-K rebuilt with evict_first weight TMAs for M=3..16 (`stack1`) | 4.895 | 8.221 (B=2 **5.496**, B=4 **6.738**) |
-| + T1, a LIGHT MoE-tail kernel replacing vLLM's all-reduce/RMSNorm/reduce-scatter + up-projection (120 CTAs x 128 threads, <=40 KB smem, vLLM-order bit-exact), used at M=1 with the successor trigger after its H4 publish (`t1m1`) | **4.840** | **8.165** (B=2 5.501, B=4 6.742) |
+| + T1, a LIGHT MoE-tail kernel replacing vLLM's all-reduce/RMSNorm/reduce-scatter + up-projection (120 CTAs x 128 threads, <=40 KB smem, vLLM-order bit-exact), used at M=1 with the successor trigger after its H4 publish (`t1m1`) | 4.840 | 8.165 (B=2 5.501, B=4 6.742) |
+| + K3EF=route,mla + moe8 v12 (DSMEM FC1->FC2 hand-off at M=3..4, 144-CTA grids) (`m8v12`) | 4.839 | 8.144 (B=2 5.437, B=4 6.591) |
+| + T1 v4: every 128-B mailbox line written by a single warp (8 lanes x 16 B) instead of 8 CTAs, which avoids L2 write-behind-poll interlocks; T1 now used at M<=2 (`t1v4m2`) | **4.727** | **8.139** (B=2 **5.374**, B=4 **6.587**) |
 | (separately measured, GSM8K pending) evict_first weight TMAs in route_shared / routing-only MoE block, `K3EF=route,mla` on `stack1` (`efall`) | 4.892 | - (B=2 5.437, B=4 6.638) |
 
 Next: per-layer persistent kernels (ATTN / MOE / TAIL). See `DESIGN_PLAN.md` for the plan to get B=1/B=2 past the TPU.
