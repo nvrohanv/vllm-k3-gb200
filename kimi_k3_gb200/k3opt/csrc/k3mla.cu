@@ -136,6 +136,25 @@ __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem_u32(dst)), "l"(src)
                : "memory");
 }
+// K3EF_MLA (l2pf 2026-09-26, evict-first audit; build with -DK3EF_MLA, env K3EF=mla): the q_b / W_UK / W_UV weight
+// loads (read once per layer and step) carry .L2::cache_hint evict_first; the KV-cache loads keep the default policy.
+#ifdef K3EF_MLA
+__device__ __forceinline__ void bulk_g2s_w(void* dst, const void* src, uint32_t bytes, uint64_t* bar) {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], "
+               "%4;" ::"r"(smem_u32(dst)), "l"(src), "r"(bytes), "r"(smem_u32(bar)), "l"(pol) : "memory");
+}
+__device__ __forceinline__ void cp_async16_w(void* dst, const void* src) {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(smem_u32(dst)), "l"(src), "l"(pol)
+               : "memory");
+}
+#else
+#define bulk_g2s_w bulk_g2s
+#define cp_async16_w cp_async16
+#endif
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16(x)); }
@@ -208,16 +227,16 @@ __global__ void __launch_bounds__(kThreads, 1)
     fence_mbar_init();
     mbar_expect_tx(&s.barw, kRowsA * kQL * 2);
     // this CTA's 12 q_b rows are one contiguous 36 KB range
-    bulk_g2s(&s.wqb[0][0], W_qb + (static_cast<size_t>(h) * kQHead + kRowsA * r) * kQL, kRowsA * kQL * 2, &s.barw);
+    bulk_g2s_w(&s.wqb[0][0], W_qb + (static_cast<size_t>(h) * kQHead + kRowsA * r) * kQL, kRowsA * kQL * 2, &s.barw);
     mbar_expect_tx(&s.barq, kNope * B * 4);  // q_nope rows x B tokens, from CTAs 0..10
   }
   cluster_arrive_relaxed();  // "running, mbarriers initialized" (waited on before the first push)
   {
     for (int c = tid; c < kNope * kLA / 8; c += kThreads) {
       const int p = c / (kLA / 8), j = c % (kLA / 8);
-      cp_async16(&s.wuk[p][j * 8], W_UK_T + h * uk_sh + p * uk_sp + kLA * r + j * 8);
+      cp_async16_w(&s.wuk[p][j * 8], W_UK_T + h * uk_sh + p * uk_sp + kLA * r + j * 8);
     }
-    for (int c = tid; c < kQL / 8; c += kThreads) cp_async16(&s.wqa[c * 8], w_qa + c * 8);
+    for (int c = tid; c < kQL / 8; c += kThreads) cp_async16_w(&s.wqa[c * 8], w_qa + c * 8);
     cp_async_commit();
   }
   TS(1)
@@ -539,7 +558,7 @@ __global__ void __launch_bounds__(kThreads, 2)  // <= 128 regs -> 2 CTAs/SM (14 
   // (cp.async, 3072 x 16 B: measured faster than 768 64-byte TMA bulk copies, whose issue is slow)
   for (int c = tid; c < kNOut * (kLatPerCta / 8); c += kThreads) {
     const int o = c >> 2, ch = c & 3, hh = o / kV, v = o % kV;
-    cp_async16(&s.wuv[o][8 * ch], W_UV + hh * uv_sh + v * uv_sv + kLatPerCta * r + 8 * ch);
+    cp_async16_w(&s.wuv[o][8 * ch], W_UV + hh * uv_sh + v * uv_sv + kLatPerCta * r + 8 * ch);
   }
   cp_async_commit();
   cluster_arrive_relaxed();  // "running, mbarriers initialized" (waited on before the first remote copy)

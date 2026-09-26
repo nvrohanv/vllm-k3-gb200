@@ -27,6 +27,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <cstdlib>
 
 namespace {
 
@@ -139,6 +140,21 @@ void launch_prefetch(const at::Tensor& ranges, int64_t n, int64_t grid, int64_t 
   TORCH_CHECK(policy != 4 || chunk <= 32768, "k3pf: policy 4 (TMA load) needs chunk <= 32 KB");
   if (n == 0) return;
   c10::cuda::CUDAGuard guard(ranges.device());
+  // K3PF_CARVEOUT=<0..100> (l2pf 2026-09-26, moefused T1 finding): shared-memory carveout preference of the k3pf
+  // kernels. Their zero-smem CTAs otherwise get the default (small-shared) carveout, so an SM hosting one cannot
+  // take a ~190 KB CTA of the next big kernel until it drains; 100 = max shared. Unset = unchanged (driver default).
+  static const int carveout = [] {
+    const char* e = std::getenv("K3PF_CARVEOUT");
+    return (e && *e) ? std::atoi(e) : -2;
+  }();
+  static bool carveout_set = false;
+  if (carveout >= -1 && !carveout_set) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k3pf_prefetch_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                        carveout));
+    C10_CUDA_CHECK(cudaFuncSetAttribute(k3pf_tmaload_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                        carveout));
+    carveout_set = true;
+  }
   const int64_t* r = ranges.data_ptr<int64_t>();
   int ni = (int)n, pi = (int)policy;
   cudaLaunchConfig_t cfg = {};

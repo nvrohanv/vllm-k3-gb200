@@ -54,6 +54,16 @@ MoE-tail replacement (experimental, default off; K3MOEBLOCK_TAIL=fused|kernel, T
             W_up staged after the RMS exchange) | 4 (8 x 4-CTA clusters; needs K3MOEBLOCK_GRID=112) | 1 (flat));
             on the k3moe8 path k3mk.tail runs in front mode (finalizes gemm2 itself) only with K3MK_FRONT=1
             (else those layers keep moe8 + vLLM's tail). par = layer_idx % 3.
+    t1      (design_persistent Stage 1 "T1", agents/moefused/t1.cu, namespace k3t1; needs tail2.cu (k3mk) too)
+            the LIGHT MoE tail: 120 CTAs (15 x 8-clusters; K3T1_NC=14 -> 112), 128 thr, <= 120 regs, <= 40 KB smem,
+            max-shared carveout, PDL trigger at entry (K3T1_TRIG=1: after its poll), no griddepcontrol.wait in
+            publish mode. Same mailboxes / protocol as k3mk (agents/moefused/T1_INTERFACE.md), bit-identical output.
+            CUDA-core block path (M=1 with K3MOEFRONT=0): PUBLISH-mode block kernel + T1 publish mode.
+            k3moe8 / k3moebody path and the K3MOEFRONT front kernel: T1 FRONT mode (always; it finalizes gemm2 /
+            wts / shared_out itself after griddepcontrol.wait) until those kernels get the publish epilogue.
+            Next-layer L2 prefetch on T1 layers: K3T1_PF = fork (default: the k3pf side-stream fork, as today) |
+            off | entry (T1 issues it before polling) | after (T1 issues it after its H4 publish);
+            K3T1_PF_ISSUERS / K3T1_PF_CHUNK tune the in-kernel modes.
 
 MoE FRONT END (DESIGN_PLAN W1-3 "moefront", agents/oproj/front; K3MOEFRONT=1, default off; TP16, M <= 2):
     Needs agents/oproj/front/moe_front.cu (namespace k3mf) + oproj_front.cu (namespace k3oprojf) built, and
@@ -249,8 +259,13 @@ def _front_expected(moe) -> bool:
     return bool(exp)
 
 
+# K3T1_MAX_M (coordinator 2026-09-26): T1 only for decode M <= this (larger M keep vLLM's tail). In-server t1tr2
+# (K3T1_TRIG=2) won at B1 (4.826 vs 4.895) but lost at B2 (5.646 vs 5.496).
+_T1_MAX_M = int(os.environ.get("K3T1_MAX_M", "8"))
+
+
 def _k3mk_buffers():
-    """Collective (all TP ranks, at model construction): mailboxes of k3mk.tail (DESIGN_PLAN W1-2)."""
+    """Collective (all TP ranks, at model construction): mailboxes of k3mk.tail (DESIGN_PLAN W1-2) and k3t1.tail."""
     if "k3mk" in _TAIL:
         return _TAIL["k3mk"]
     import torch.distributed as dist
@@ -277,7 +292,10 @@ def _k3mk_buffers():
         return None
     _TAIL["k3mk"] = dict(lat=lat, lat_mc=mc, rs=rs, rs_peers=peers, rank=dist.get_rank(group),
                          epoch=torch.zeros(64, dtype=torch.int64, device=dev),
-                         variant=int(os.environ.get("K3MK_TAIL_VARIANT", "14")))
+                         variant=int(os.environ.get("K3MK_TAIL_VARIANT", "14")),
+                         # T1: its own readers-done counters (they count modulo its cluster count)
+                         t1_cnt=torch.zeros(64, dtype=torch.int64, device=dev),
+                         t1_nc=int(os.environ.get("K3T1_NC", "15")))
     return _TAIL["k3mk"]
 
 
@@ -407,8 +425,8 @@ def _build_layer_state(moe):
     st = k3._down_state
     shard = _LAT // st["tp"]
     tail = None
-    if _TAIL_MODE in ("fused", "kernel", "k3mk"):
-        tb = _k3mk_buffers() if _TAIL_MODE == "k3mk" else _tail_buffers()
+    if _TAIL_MODE in ("fused", "kernel", "k3mk", "t1"):
+        tb = _k3mk_buffers() if _TAIL_MODE in ("k3mk", "t1") else _tail_buffers()
         if tb is None:
             tb = {"lat": None}
         top = getattr(runner, "_k3_latent_moe_tail_op", None)
@@ -460,6 +478,50 @@ def _layer_state(moe):
     return s
 
 
+_T1_PF = os.environ.get("K3T1_PF", "fork").strip().lower()
+_T1_PF_ISS = int(os.environ.get("K3T1_PF_ISSUERS", "0"))
+_T1_PF_CHUNK = int(os.environ.get("K3T1_PF_CHUNK", "0"))
+
+
+def _t1_prefetch(runner, m):
+    """Next-layer L2 prefetch on a T1 layer (K3T1_PF). 'fork': k3pf side-stream fork at today's point (after FC2,
+    before the tail); 'off': none; 'entry' / 'after': T1 issues it itself from l2pf_patch's per-runner range table
+    (same eligibility as launch_after_moe). Returns (ranges or None, T1 pf_mode)."""
+    if _T1_PF == "off":
+        return None, 0
+    try:
+        import l2pf_patch
+    except ImportError:
+        return None, 0
+    if not l2pf_patch._STATE["patched"]:
+        return None, 0
+    if _T1_PF not in ("entry", "after"):
+        l2pf_patch.launch_after_moe(runner, m)
+        return None, 0
+    if m <= 0 or m > l2pf_patch.MAX_TOKENS or torch.compiler.is_compiling():
+        return None, 0
+    if not l2pf_patch._STATE["built"]:
+        if torch.cuda.is_current_stream_capturing():
+            return None, 0
+        l2pf_patch.build_tables()
+    entry = l2pf_patch._STATE["tables"].get(id(runner))
+    if entry is None or entry[3]() is not runner:
+        return None, 0
+    _STATE["stats"]["t1_pf_inkernel"] = _STATE["stats"].get("t1_pf_inkernel", 0) + 1
+    return entry[0], (1 if _T1_PF == "entry" else 2)
+
+
+def _t1_tail(kb, tail, m, front, pf):
+    """k3t1.tail: publish mode (front = None) or front mode (front = (gemm2, wts, shared_out))."""
+    rng, pfm = pf
+    fr = (front[0], front[1], front[2], kb["lat_mc"], kb["rs_peers"]) if front is not None else (None, None, None, 0,
+                                                                                                None)
+    torch.ops.k3t1.tail(kb["lat"], kb["rs"], tail["par3"], tail["w_up"], tail["gamma"], tail["eps"], tail["mb"],
+                        tail["mb_mc"], kb["t1_cnt"], kb["rank"], m, None, *fr, kb.get("multicast", True), kb["t1_nc"],
+                        rng, pfm, _T1_PF_ISS, _T1_PF_CHUNK)
+    _STATE["stats"]["tail_t1"] = _STATE["stats"].get("tail_t1", 0) + 1
+
+
 def _forward_small(moe, s, hidden_states):
     from vllm.model_executor.layers.fused_moe.moe_output import UnfinalizedMoEOutput
     from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
@@ -505,6 +567,36 @@ def _forward_small(moe, s, hidden_states):
     # vLLM's tail.
     use_k3mk = tail is not None and _TAIL_MODE == "k3mk" and (
         not (_moe8_enabled(m) or use_body) or os.environ.get("K3MK_FRONT", "0") == "1")
+    if tail is not None and _TAIL_MODE == "t1" and _TAIL.get("k3mk") and m <= _T1_MAX_M:
+        KM = torch.ops.k3mk
+        kb = _TAIL["k3mk"]
+        par = tail["par3"]
+        empty = torch.empty(0, dtype=torch.bfloat16, device=dev)
+        runner = s["runner"]
+        if use_body or _moe8_enabled(m):  # tcgen05 FC1/FC2 -> T1 front mode (finalizes gemm2, publishes)
+            latent = torch.empty(m, _LAT, dtype=torch.bfloat16, device=dev)
+            K.moe_block_lamport(mailbox, scores, *s["w"], workspace, _barrier(dev), gemm2, ids, wts, h_sh,
+                                s["sh_down"], shared_out, s["betas"][0], s["betas"][1], s["renorm"],
+                                s["scale"], _grid(), s["sh_beta"], s["sh_lbeta"], None, latent)
+            if use_body:
+                torch.ops.k3moebody.expert_body(latent, ids, None, *s["w"], _moebody_workspace(dev), None, gemm2,
+                                                0, s["betas"][0], s["betas"][1])
+            else:
+                torch.ops.k3moe8.moe_fused_unfinalized(latent, ids, *s["w"], _moe8_workspace(dev),
+                                                       _barrier(dev), gemm2, s["betas"][0], s["betas"][1])
+            front = (gemm2, wts, shared_out)
+        else:  # CUDA-core block kernel with the PUBLISH epilogue (no gemm2_out / shared_out) -> T1 publish mode
+            KM.moe_block_lamport(mailbox, scores, *s["w"], workspace, _barrier(dev), empty, ids, wts, h_sh,
+                                 s["sh_down"], empty, s["betas"][0], s["betas"][1], s["renorm"], s["scale"],
+                                 _grid(), s["sh_beta"], s["sh_lbeta"], None, None, kb["lat"], kb["lat_mc"],
+                                 kb["rs_peers"], par, kb["rank"], kb.get("multicast", True))
+            front = None
+        pf = _t1_prefetch(runner, m)  # K3T1_PF=fork forks k3pf here (same point as the other tails)
+        _t1_tail(kb, tail, m, front, pf)
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, h_sh, scores, workspace]
+        result = _tail_result(runner, tail, m)
+        _STATE["stats"]["fused"] += 1
+        return result.view(num_tokens, hidden)
     if use_k3mk:
         KM = torch.ops.k3mk
         kb = _TAIL["k3mk"]
@@ -661,6 +753,13 @@ def _forward_front(moe, s, x, m, par, num_tokens, hidden):
     _STATE["stats"]["front"] = _STATE["stats"].get("front", 0) + 1
     runner = s["runner"]
     tail = s.get("tail")
+    if tail is not None and _TAIL_MODE == "t1" and _TAIL.get("k3mk") and m <= _T1_MAX_M:
+        # T1 FRONT mode on the front kernel's gemm2 / wts / shared_out (until moe_front has the publish epilogue,
+        # agents/moefused/T1_INTERFACE.md); K3T1_PF decides fork / in-kernel / off for the next-layer prefetch
+        pf = _t1_prefetch(runner, m)
+        _t1_tail(_TAIL["k3mk"], tail, m, (gemm2, wts, shared_out), pf)
+        _KEEPALIVE[:] = [x, gemm2, wts, shared_out, ids, workspace]
+        return _tail_result(runner, tail, m).view(num_tokens, hidden)
     k3mk_tail = tail is not None and _TAIL_MODE == "k3mk" and bool(_TAIL.get("k3mk"))
     pf_mode = _k3mk_pf_mode() if k3mk_tail else "before"
     if pf_mode == "before":  # K3OPT_L2PF: same fork point as the other paths (after FC2, before the tail)
@@ -712,7 +811,8 @@ def _tail_result(runner, tail, m):
 def _register_fakes() -> None:
     # The new ops only mutate their arguments; give torch.compile/functionalization a no-op fake.
     for name in ("k3moe::route_shared", "k3moe::moe_block_lamport", "k3moe::moe_block_tail", "k3moe::moe_tail",
-                 "k3mk::moe_block_lamport", "k3mk::tail", "k3moebody::expert_body", "k3mf::moe_block_front"):
+                 "k3mk::moe_block_lamport", "k3mk::tail", "k3moebody::expert_body", "k3mf::moe_block_front",
+                 "k3t1::tail"):
         try:
             torch.library.register_fake(name)(lambda *args, **kwargs: None)
         except Exception:  # noqa: BLE001  (already registered, or no tracing support)
@@ -733,10 +833,12 @@ def patch_moeblock(load_ext) -> None:
     KimiMoE = k3_model.KimiMoE
     orig = KimiMoE.forward
     _STATE["orig_forward"] = orig
-    if _TAIL_MODE in ("fused", "kernel", "k3mk"):
-        if _TAIL_MODE == "k3mk":
+    if _TAIL_MODE in ("fused", "kernel", "k3mk", "t1"):
+        if _TAIL_MODE in ("k3mk", "t1"):
             if not (hasattr(torch.ops, "k3mk") and hasattr(torch.ops.k3mk, "tail")):
-                raise RuntimeError("K3MOEBLOCK_TAIL=k3mk needs agents/moefused/tail2.cu built (namespace k3mk)")
+                raise RuntimeError("K3MOEBLOCK_TAIL=k3mk|t1 needs agents/moefused/tail2.cu built (namespace k3mk)")
+            if _TAIL_MODE == "t1" and not (hasattr(torch.ops, "k3t1") and hasattr(torch.ops.k3t1, "tail")):
+                raise RuntimeError("K3MOEBLOCK_TAIL=t1 needs agents/moefused/t1.cu built (namespace k3t1)")
         elif not (hasattr(torch.ops.k3moe, "moe_tail") and hasattr(torch.ops.k3moe, "moe_block_tail")):
             raise RuntimeError("K3MOEBLOCK_TAIL needs the k3moe build with moe_tail / moe_block_tail")
         orig_init = KimiMoE.__init__
@@ -744,7 +846,7 @@ def patch_moeblock(load_ext) -> None:
         def __init__(self, *args, **kwargs):
             orig_init(self, *args, **kwargs)
             # collective symmetric-memory setup at model init (every rank, same order)
-            _k3mk_buffers() if _TAIL_MODE == "k3mk" else _tail_buffers()
+            _k3mk_buffers() if _TAIL_MODE in ("k3mk", "t1") else _tail_buffers()
 
         KimiMoE.__init__ = __init__
     if _FRONT:
